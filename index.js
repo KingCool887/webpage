@@ -172,4 +172,4 @@ app.use(async (req, res) => {
   }
 });
 
-app.listen(PORT, () => console.log(`Proxy listening on :${PORT}`));
+app.listen(PORT, '0.0.0.0', () => console.log(`Proxy listening on :${PORT}`));
