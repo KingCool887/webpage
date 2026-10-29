@@ -20,7 +20,7 @@
 </head>
 <body>
   <header id="toolbar">
-    <form id="address-form" autocomplete="off">
+    <form id="address-form" autocomplete="off" onsubmit="event.preventDefault(); document.getElementById('launch-btn').click();">
       <input id="address" name="address" type="text" inputmode="url" placeholder="Enter a website address (e.g., deadshot.io)" aria-label="Website address" autocomplete="off" spellcheck="false" value="deadshot.io">
     </form>
     <button id="launch-btn" class="tool" type="button">Launch</button>
@@ -29,7 +29,7 @@
     <iframe id="viewer" title="Website view" allow="autoplay; fullscreen; gamepad; clipboard-read; clipboard-write; identity-credentials-get" referrerpolicy="no-referrer"></iframe>
   </main>
   <script>
-    window.__PV_SESSION__ = "__PV_SESSION_JSON__";
+    window.__PV_SESSION__ = __PV_SESSION_JSON__;
     const address = document.querySelector('#address');
     const viewer = document.querySelector('#viewer');
     const proxyPort = __PROXY_PORT__;
