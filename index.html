@@ -1,570 +1,121 @@
-<!doctype html>
+<!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <meta name="referrer" content="no-referrer">
-  <title>Website Viewer</title>
+  <title>Game Proxy</title>
   <style>
-    :root { color-scheme: dark; font: 14px/1.4 system-ui, sans-serif; background: #0d1118; color: #eef2f8; }
-    * { box-sizing: border-box; }
-    html, body { height: 100%; }
-    body { margin: 0; display: flex; flex-direction: column; overflow: hidden; }
-    #toolbar { display: flex; align-items: center; gap: 8px; padding: 8px 10px; background: #171d28; border-bottom: 1px solid #2a3444; }
-    #address-form { flex: 1 1 auto; display: flex; min-width: 0; margin: 0; }
-    #address { width: 100%; min-width: 0; padding: 8px 14px; color: inherit; background: #0b1017; border: 1px solid #2f3a4c; border-radius: 999px; font: inherit; }
-    #address:focus { outline: none; border-color: #5b8fd6; box-shadow: 0 0 0 2px #5b8fd633; }
-    #mode { flex: 0 0 auto; padding: 8px 10px; color: inherit; background: #0b1017; border: 1px solid #2f3a4c; border-radius: 8px; font: inherit; }
-    .tool { flex: 0 0 auto; padding: 8px 10px; color: #c3cddc; background: transparent; border: 1px solid transparent; border-radius: 8px; font: inherit; cursor: pointer; }
-    .tool:hover { background: #232c3b; border-color: #2f3a4c; }
-    .tool:disabled { opacity: .4; cursor: default; background: transparent; border-color: transparent; }
-    #stage { position: relative; flex: 1 1 auto; min-height: 0; display: flex; background: #05070a; }
-    #stage:fullscreen { background: #000; }
-    #viewer { display: none; flex: 1 1 auto; width: 100%; height: 100%; border: 0; background: #0b0f16; }
-    #viewer.active { display: block; }
-    #stream-panel { display: none; flex: 1 1 auto; min-width: 0; min-height: 0; }
-    #stream-panel.active { display: flex; }
-    #stream-panel.game-mouse-locked #stream-view { cursor: none; }
-    #stream-view { display: block; flex: 1 1 auto; width: 100%; height: 100%; min-width: 0; min-height: 0; object-fit: contain; background: #05070a; touch-action: none; cursor: crosshair; outline: none; }
-    #status { position: absolute; left: 12px; bottom: 12px; max-width: min(70ch, 80%); padding: 6px 12px; border: 1px solid #2a3444; border-radius: 999px; background: #111826e6; color: #c7d3e4; font-size: 12px; pointer-events: none; opacity: 0; transition: opacity .15s ease; }
-    #status.visible { opacity: 1; }
-    #stream-diagnostics { display: none; position: absolute; left: 12px; right: 12px; bottom: 12px; max-height: 45%; overflow: auto; margin: 0; padding: 10px 12px; border: 1px solid #2a3444; border-radius: 10px; background: #0b1017f2; color: #d6e2f1; white-space: pre-wrap; overflow-wrap: anywhere; font: 12px/1.45 ui-monospace, monospace; }
-    #stream-diagnostics.active { display: block; }
-    #stage:fullscreen #status, #stage:fullscreen #stream-diagnostics { display: none; }
+    :root { color-scheme: dark; font: 14px/1.4 system-ui, sans-serif; background: #000; color: #eef2f8; }
+    body { margin: 0; display: flex; flex-direction: column; height: 100vh; overflow: hidden; }
+    
+    /* The Auth Screen */
+    #auth-screen { position: fixed; inset: 0; background: #000; display: flex; flex-direction: column; align-items: center; justify-content: center; z-index: 999; }
+    #auth-box { text-align: center; }
+    #key-input { width: 300px; padding: 12px; margin-bottom: 10px; border-radius: 8px; border: 1px solid #333; background: #111; color: #fff; text-align: center; font-size: 16px; outline: none; }
+    #key-input:focus { border-color: #5b8fd6; }
+    #auth-btn { padding: 12px 24px; border-radius: 8px; border: none; background: #232c3b; color: #fff; cursor: pointer; font-size: 16px; width: 300px; }
+    #auth-btn:hover { background: #2f3a4c; }
+    #auth-error { color: #ff6b6b; margin-top: 10px; height: 20px; font-size: 13px; }
+
+    /* The Launcher UI (Hidden by default) */
+    #app { display: none; flex-direction: column; height: 100%; }
+    #toolbar { display: flex; gap: 8px; padding: 10px; background: #171d28; border-bottom: 1px solid #2a3444; }
+    #url { flex: 1; padding: 8px 14px; border-radius: 999px; border: 1px solid #2f3a4c; background: #0b1017; color: white; }
+    #go { padding: 8px 16px; border-radius: 8px; border: 1px solid #2f3a4c; background: #232c3b; color: white; cursor: pointer; }
+    #frame { flex: 1; border: none; background: #000; width: 100%; height: 100%; }
   </style>
 </head>
 <body>
-  <header id="toolbar">
-    <form id="address-form" autocomplete="off">
-      <input id="address" name="address" type="text" inputmode="url" placeholder="Enter a website address and press Enter" aria-label="Website address" autocomplete="off" spellcheck="false">
-    </form>
-    <select id="mode" aria-label="Loading mode" title="Streamed runs the site in a hidden browser (best for games); In-page loads it through the local proxy">
-      <option value="streamed" selected>Streamed</option>
-      <option value="proxy">In-page</option>
-    </select>
-    <button id="diagnostics-toggle" class="tool" type="button" title="Show streamed-browser diagnostics">Diagnostics</button>
-    <button id="stream-stop" class="tool" type="button" title="Stop the hidden browser" disabled>Stop</button>
-    <button id="logout" class="tool" type="button" title="Log out">Log out</button>
-</header>
-  <main id="stage">
-    <iframe id="viewer" title="Website view" allow="autoplay; fullscreen; gamepad; clipboard-read; clipboard-write; identity-credentials-get" referrerpolicy="no-referrer"></iframe>
-    <section id="stream-panel" aria-label="Streamed browser">
-      <img id="stream-view" alt="Live view from the hidden browser" tabindex="0" draggable="false">
-    </section>
-    <div id="status" role="status" aria-live="polite"></div>
-    <pre id="stream-diagnostics" aria-live="polite">Diagnostics will appear here.</pre>
-  </main>
+
+  <!-- AUTH SCREEN -->
+  <div id="auth-screen">
+    <div id="auth-box">
+      <input id="key-input" type="password" placeholder="Enter Access Key" autocomplete="off">
+      <button id="auth-btn">Unlock</button>
+      <div id="auth-error"></div>
+    </div>
+  </div>
+
+  <!-- LAUNCHER (Hidden) -->
+  <div id="app">
+    <div id="toolbar">
+      <input id="url" type="text" placeholder="Enter website address (e.g., deadshot.io)" value="deadshot.io">
+      <button id="go">Launch</button>
+    </div>
+    <iframe id="frame" allow="autoplay; fullscreen; gamepad; clipboard-read; clipboard-write; identity-credentials-get" referrerpolicy="no-referrer"></iframe>
+  </div>
+
   <script>
-    window.__PV_SESSION__ = __PV_SESSION_JSON__;
-    const addressForm = document.querySelector('#address-form');
-    const address = document.querySelector('#address');
-    const modeSelect = document.querySelector('#mode');
-    const stage = document.querySelector('#stage');
-    const viewer = document.querySelector('#viewer');
-    const streamPanel = document.querySelector('#stream-panel');
-    const streamView = document.querySelector('#stream-view');
-    const statusPill = document.querySelector('#status');
-    const diagnostics = document.querySelector('#stream-diagnostics');
-    const diagnosticsToggle = document.querySelector('#diagnostics-toggle');
-    const streamStop = document.querySelector('#stream-stop');
-    const proxyDiagnostics = [];
-    let streamed = false;
-    let streamWidth = 1280;
-    let streamHeight = 720;
-    let gamePointerLocked = false;
-    let nativePointerLock = false;
-    let gameWantsFullscreen = false;
-    let statusPinned = false;
-    let statusTimer = 0;
-    let lastFullscreenAttempt = 0;
-    let lastPointerLockAttempt = 0;
-    let pointerLockDismissed = false;
-    let virtualX = streamWidth / 2;
-    let virtualY = streamHeight / 2;
-    const forwardedButtons = new Set();
-    let frameCount = 0;
-    let lastFrameCount = 0;
-    let lastFpsAt = Date.now();
+    // ==========================================
+    // CONFIGURATION - UPDATE THIS WITH YOUR RENDER URL
+    // ==========================================
+    const PROXY_URL = "https://webpage-50r9.onrender.com";
+    // ==========================================
 
-    function setStatus(message, pinned = false) {
-      statusPill.textContent = message;
-      statusPill.classList.add('visible');
-      statusPinned = pinned;
-      clearTimeout(statusTimer);
-      if (!pinned) statusTimer = setTimeout(() => statusPill.classList.remove('visible'), 4000);
-    }
-
-    function normalizeAddress(value) {
-      const trimmed = value.trim();
-      return new URL(/^[a-z][a-z\d+.-]*:\/\//i.test(trimmed) ? trimmed : `https://${trimmed}`);
-    }
-
-    const proxyPort = __PROXY_PORT__;
-
-    function proxyHost(hostname) {
-      let hash = 14695981039346656037n;
-      for (const character of hostname.toLowerCase()) {
-        hash ^= BigInt(character.charCodeAt(0));
-        hash = BigInt.asUintN(64, hash * 1099511628211n);
+    // XOR Obfuscation (must match server.js)
+    const XOR_KEY = "GhostProxy2026";
+    const xorEncode = (str) => {
+      let bin = "";
+      for (let i = 0; i < str.length; i++) {
+        bin += String.fromCharCode(str.charCodeAt(i) ^ XOR_KEY.charCodeAt(i % XOR_KEY.length));
       }
-      return `p-${hash.toString(36)}.localhost`;
-    }
+      return btoa(bin).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+    };
 
-    function proxyUrl(target) {
-      const session = window.__PV_SESSION__ || '';
-      const sep = target.search ? '&' : '?';
-      return `/p/${toBase64Url(target.href)}${target.pathname}${target.search}${sep}__k=${encodeURIComponent(session)}`;
-    }
+    let sessionToken = null;
 
-    function toBase64Url(value) {
-      const bytes = new TextEncoder().encode(value);
-      let binary = '';
-      for (const byte of bytes) binary += String.fromCharCode(byte);
-      return btoa(binary).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/g, '');
-    }
+    document.getElementById('auth-btn').addEventListener('click', async () => {
+      const key = document.getElementById('key-input').value.trim();
+      const errorDiv = document.getElementById('auth-error');
+      const btn = document.getElementById('auth-btn');
 
-    function resetStreamState() {
-      gamePointerLocked = false;
-      nativePointerLock = false;
-      gameWantsFullscreen = false;
-      forwardedButtons.clear();
-      outbox.length = 0;
-      pendingDX = 0;
-      pendingDY = 0;
-      pendingButtons = 0;
-      needMove = false;
-      moveQueued = false;
-      moveMode = 'absolute';
-      pointerLockDismissed = false;
-      virtualX = streamWidth / 2;
-      virtualY = streamHeight / 2;
-      frameCount = 0;
-      lastFrameCount = 0;
-      lastFpsAt = Date.now();
-      streamPanel.classList.remove('game-mouse-locked');
-      if (document.pointerLockElement) document.exitPointerLock();
-    }
+      if (!key) return;
+      btn.textContent = 'Verifying...';
+      errorDiv.textContent = '';
 
-    addressForm.addEventListener('submit', (event) => {
-      event.preventDefault();
-      launch().catch((error) => setStatus(error.message || 'Could not open the website.', true));
-    });
-
-    async function launch() {
-      let target;
       try {
-        target = normalizeAddress(address.value);
-        if (!['http:', 'https:'].includes(target.protocol)) throw new Error('Use an HTTP or HTTPS address.');
-      } catch {
-        setStatus('Enter a valid website address.', true);
-        address.focus();
-        return;
-      }
-      address.value = target.href;
-      document.title = 'Website Viewer';
-      if (modeSelect.value === 'proxy') await openInPage(target);
-      else await openStreamed(target);
-    }
-
-    async function stopStreaming() {
-      if (!streamed) return;
-      streamed = false;
-      resetStreamState();
-      streamView.removeAttribute('src');
-      await fetch('/stream/stop', { method: 'POST' }).catch(() => {});
-    }
-
-    async function openInPage(target) {
-      await stopStreaming();
-      streamStop.disabled = true;
-      if (document.fullscreenElement) document.exitFullscreen().catch(() => {});
-      streamPanel.classList.remove('active');
-      proxyDiagnostics.length = 0;
-      diagnosticsToggle.textContent = 'Diagnostics';
-      viewer.src = proxyUrl(target);
-      viewer.classList.add('active');
-      setStatus('Loading through the local proxy…');
-    }
-
-    async function openStreamed(target) {
-      await stopStreaming();
-      if (document.fullscreenElement) document.exitFullscreen().catch(() => {});
-      viewer.classList.remove('active');
-      viewer.removeAttribute('src');
-      streamPanel.classList.add('active');
-      proxyDiagnostics.length = 0;
-      diagnosticsToggle.textContent = 'Diagnostics';
-      resetStreamState();
-      setStatus('Starting the hidden browser…', true);
-      try {
-        const response = await fetch('/stream/start', {
+        const res = await fetch(`${PROXY_URL}/api/auth`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ url: target.href }),
-          cache: 'no-store',
+          body: JSON.stringify({ key })
         });
-        if (!response.ok) throw new Error((await response.text()) || 'Could not start the hidden browser.');
-        streamStop.disabled = false;
-        streamView.src = `/stream?t=${Date.now()}`;
-        streamed = true;
-        requestAnimationFrame(() => syncStreamViewport());
-        setStatus('Live · waiting for frames…');
-      } catch (error) {
-        streamPanel.classList.remove('active');
-        setStatus(error.message || 'Could not start the hidden browser.', true);
-      }
-    }
-
-    // Input is batched and mouse movement coalesces to the newest position.
-    // While the game holds the mouse, the launcher also takes a real pointer
-    // lock: the OS cursor is captured, so movement never stops at a screen
-    // edge, and the relative deltas are replayed into the hidden page.
-    const outbox = [];
-    let inputInFlight = false;
-    let pendingDX = 0;
-    let pendingDY = 0;
-    let pendingX = 0;
-    let pendingY = 0;
-    let pendingButtons = 0;
-    let needMove = false;
-    let moveQueued = false;
-    let moveMode = 'absolute';
-
-    function queueInput(payload) {
-      if (!streamed) return;
-      const last = outbox[outbox.length - 1];
-      if (payload.type === 'pointer' && payload.eventType === 'mousemove' && last && last.type === 'pointer' && last.eventType === 'mousemove') {
-        last.dx += payload.dx;
-        last.dy += payload.dy;
-        last.buttons = payload.buttons;
-      } else if (payload.eventType === 'mouseMoved' && last && last.eventType === 'mouseMoved') {
-        Object.assign(last, payload);
-      } else outbox.push(payload);
-      flushInput();
-    }
-
-    function flushInput() {
-      if (inputInFlight || !outbox.length || !streamed) return;
-      inputInFlight = true;
-      const events = outbox.splice(0, outbox.length);
-      fetch('/stream/input', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ events }),
-        cache: 'no-store',
-        signal: AbortSignal.timeout(3000),
-      }).then((response) => {
-        if (response.ok || response.status === 409) return;
-        if (response.status === 400 || response.status === 415) {
-          setStatus('Restart the helper: close its PowerShell window, run Start-Game-Window.ps1 again, then reload this page.', true);
-          return;
-        }
-        throw new Error(`Input rejected (${response.status}).`);
-      }).catch(() => {
-        setStatus('Input connection lost. Load the address again or restart the helper.', true);
-      }).finally(() => {
-        inputInFlight = false;
-        if (outbox.length) flushInput();
-      });
-    }
-
-    function displayBounds() {
-      const rect = streamView.getBoundingClientRect();
-      const scale = Math.min(rect.width / streamWidth, rect.height / streamHeight);
-      const width = streamWidth * scale;
-      const height = streamHeight * scale;
-      return { rect, scaleX: scale, scaleY: scale, left: rect.left + (rect.width - width) / 2, top: rect.top + (rect.height - height) / 2 };
-    }
-
-    function pointFromClient(clientX, clientY, bounds) {
-      return {
-        x: Math.max(0, Math.min(streamWidth - 1, (clientX - bounds.left) / bounds.scaleX)),
-        y: Math.max(0, Math.min(streamHeight - 1, (clientY - bounds.top) / bounds.scaleY)),
-      };
-    }
-
-    function currentPoint(event) {
-      if (gamePointerLocked && document.pointerLockElement) return { x: virtualX, y: virtualY };
-      return pointFromClient(event.clientX, event.clientY, displayBounds());
-    }
-
-    function flushMove() {
-      moveQueued = false;
-      if (!streamed || !needMove) return;
-      needMove = false;
-      if (moveMode === 'delta') {
-        if (!document.pointerLockElement) {
-          pendingDX = 0;
-          pendingDY = 0;
-          return;
-        }
-        const bounds = displayBounds();
-        const dx = pendingDX / bounds.scaleX;
-        const dy = pendingDY / bounds.scaleY;
-        pendingDX = 0;
-        pendingDY = 0;
-        if (!dx && !dy) return;
-        if (nativePointerLock) {
-          // The hidden page holds a real pointer lock: feed it trusted absolute
-          // moves, which Chrome turns into movementX/Y. Coordinates may grow
-          // without bound, so turning never stops at an edge.
-          virtualX += dx;
-          virtualY += dy;
+        
+        const data = await res.json();
+        
+        if (res.ok) {
+          sessionToken = data.token;
+          document.getElementById('auth-screen').style.display = 'none';
+          document.getElementById('app').style.display = 'flex';
         } else {
-          // Fallback when the hidden page only has a virtual lock: trusted
-          // absolute moves clamped to the viewport. Games accept these, but
-          // turning stops at the edges.
-          virtualX = Math.max(0, Math.min(streamWidth - 1, virtualX + dx));
-          virtualY = Math.max(0, Math.min(streamHeight - 1, virtualY + dy));
+          errorDiv.textContent = data.error || 'Invalid key.';
+          btn.textContent = 'Unlock';
         }
-        queueInput({ type: 'mouse', eventType: 'mouseMoved', x: virtualX, y: virtualY, buttons: pendingButtons });
-        return;
-      }
-      const point = pointFromClient(pendingX, pendingY, displayBounds());
-      virtualX = point.x;
-      virtualY = point.y;
-      queueInput({ type: 'mouse', eventType: 'mouseMoved', ...point, buttons: pendingButtons });
-    }
-
-    function mouseButton(button) {
-      return ({ 0: 'left', 1: 'middle', 2: 'right', 3: 'back', 4: 'forward' })[button] || 'none';
-    }
-
-    // The page inside the hidden browser drives full screen and mouse capture.
-    // Mirror both onto the launcher chrome as soon as the user gesture that
-    // asked for it still counts as activation; otherwise retry on the next
-    // gesture inside the stream. Toolbar clicks never request either one.
-    function activationAvailable() {
-      return !navigator.userActivation || navigator.userActivation.isActive;
-    }
-
-    function requestLauncherFullscreen() {
-      if (!streamed || !gameWantsFullscreen || document.fullscreenElement) return;
-      if (!activationAvailable()) return;
-      const now = Date.now();
-      if (now - lastFullscreenAttempt < 500) return;
-      lastFullscreenAttempt = now;
-      const request = stage.requestFullscreen?.();
-      if (request && typeof request.catch === 'function') request.catch(() => {});
-    }
-
-    function syncLauncherFullscreen() {
-      if (gameWantsFullscreen) requestLauncherFullscreen();
-      else if (document.fullscreenElement && typeof document.exitFullscreen === 'function') document.exitFullscreen().catch(() => {});
-    }
-
-    function requestLauncherPointerLock() {
-      if (!streamed || !gamePointerLocked || pointerLockDismissed || document.pointerLockElement) return;
-      if (!activationAvailable()) return;
-      const now = Date.now();
-      if (now - lastPointerLockAttempt < 500) return;
-      lastPointerLockAttempt = now;
-      const request = streamView.requestPointerLock?.();
-      if (request && typeof request.catch === 'function') request.catch(() => {});
-    }
-
-    function syncLauncherPointerLock() {
-      if (gamePointerLocked) requestLauncherPointerLock();
-      else if (document.pointerLockElement) document.exitPointerLock();
-    }
-
-    document.addEventListener('pointerlockchange', () => {
-      if (document.pointerLockElement) return;
-      if (!streamed || !gamePointerLocked) return;
-      // The user pressed Escape (or the browser dropped the capture). Release
-      // the game's virtual lock too, so the launcher chrome is usable again,
-      // and do not grab the cursor again until the user clicks the stream.
-      pointerLockDismissed = true;
-      gamePointerLocked = false;
-      moveMode = 'absolute';
-      pendingDX = 0;
-      pendingDY = 0;
-      needMove = false;
-      streamPanel.classList.remove('game-mouse-locked');
-      queueInput({ type: 'pointer', eventType: 'exit' });
-    });
-
-    window.addEventListener('pointermove', (event) => {
-      if (!streamed) return;
-      if (gamePointerLocked && document.pointerLockElement) {
-        moveMode = 'delta';
-        pendingButtons = event.buttons;
-        pendingDX += event.movementX;
-        pendingDY += event.movementY;
-      } else {
-        // Normal movement over the stream, and the fallback when the launcher
-        // could not capture the cursor for a game that asked for it.
-        if (!streamView.contains(event.target)) return;
-        moveMode = 'absolute';
-        pendingButtons = event.buttons;
-        pendingX = event.clientX;
-        pendingY = event.clientY;
-      }
-      needMove = true;
-      if (moveQueued) return;
-      moveQueued = true;
-      requestAnimationFrame(flushMove);
-    });
-    streamView.addEventListener('pointerdown', (event) => {
-      if (!streamed) return;
-      streamView.focus();
-      pointerLockDismissed = false;
-      requestLauncherPointerLock();
-      requestLauncherFullscreen();
-      flushMove();
-      const point = currentPoint(event);
-      virtualX = point.x;
-      virtualY = point.y;
-      forwardedButtons.add(event.button);
-      queueInput({ type: 'mouse', eventType: 'mousePressed', ...point, button: mouseButton(event.button), buttons: event.buttons, clickCount: event.detail || 1 });
-      event.preventDefault();
-    });
-    window.addEventListener('pointerup', (event) => {
-      if (!streamed) return;
-      const captured = gamePointerLocked && Boolean(document.pointerLockElement);
-      if (!captured && !forwardedButtons.has(event.button)) return;
-      flushMove();
-      queueInput({ type: 'mouse', eventType: 'mouseReleased', ...currentPoint(event), button: mouseButton(event.button), buttons: event.buttons });
-      forwardedButtons.delete(event.button);
-    });
-    streamView.addEventListener('contextmenu', (event) => event.preventDefault());
-    streamView.addEventListener('wheel', (event) => {
-      if (!streamed) return;
-      flushMove();
-      queueInput({ type: 'mouse', eventType: 'mouseWheel', ...currentPoint(event), deltaX: event.deltaX, deltaY: event.deltaY });
-      event.preventDefault();
-    }, { passive: false });
-
-    function modifierMask(event) {
-      return (event.altKey ? 1 : 0) | (event.ctrlKey ? 2 : 0) | (event.metaKey ? 4 : 0) | (event.shiftKey ? 8 : 0);
-    }
-    document.addEventListener('keydown', (event) => {
-      if (!streamed || document.activeElement !== streamView) return;
-      // F11 stays the browser's own full screen toggle; Escape leaves the
-      // capture or full screen that the page requested, exactly like a real
-      // browser.
-      if (event.key === 'F11') return;
-      if (event.key === 'Escape' && (document.pointerLockElement || document.fullscreenElement)) return;
-      requestLauncherPointerLock();
-      requestLauncherFullscreen();
-      queueInput({ type: 'key', eventType: 'keyDown', key: event.key, code: event.code, keyCode: event.keyCode, text: event.key.length === 1 ? event.key : '', modifiers: modifierMask(event) });
-      event.preventDefault();
-    });
-    document.addEventListener('keyup', (event) => {
-      if (!streamed || document.activeElement !== streamView) return;
-      if (event.key === 'F11') return;
-      queueInput({ type: 'key', eventType: 'keyUp', key: event.key, code: event.code, keyCode: event.keyCode, modifiers: modifierMask(event) });
-      event.preventDefault();
-    });
-    window.addEventListener('message', (event) => {
-      if (event.source !== viewer.contentWindow) return;
-      const data = event.data;
-      if (!data || data.type !== 'inpage-diagnostic') return;
-      const line = `[${new Date().toLocaleTimeString()}] ${String(data.level || 'info')}: ${String(data.message || '').slice(0, 500)}${data.detail ? ` — ${String(data.detail).slice(0, 1500)}` : ''}`;
-      proxyDiagnostics.push(line);
-      if (proxyDiagnostics.length > 500) proxyDiagnostics.shift();
-      if (diagnostics.classList.contains('active')) {
-        diagnostics.textContent += `\n${line}`;
-        diagnostics.scrollTop = diagnostics.scrollHeight;
-      } else if (!diagnosticsToggle.textContent.includes('●')) {
-        diagnosticsToggle.textContent = 'Diagnostics ●';
-        diagnosticsToggle.title = 'New in-page diagnostics (open to read)';
+      } catch (e) {
+        errorDiv.textContent = 'Connection failed.';
+        btn.textContent = 'Unlock';
       }
     });
-    diagnosticsToggle.addEventListener('click', async () => {
-      if (diagnostics.classList.contains('active')) {
-        diagnostics.classList.remove('active');
-        diagnosticsToggle.textContent = 'Diagnostics';
-        diagnosticsToggle.title = 'Show browser diagnostics';
-        return;
-      }
-      diagnostics.classList.add('active');
-      diagnosticsToggle.textContent = 'Hide';
-      diagnosticsToggle.title = 'Hide diagnostics';
-      diagnostics.textContent = proxyDiagnostics.length
-        ? `In-page mode\n${proxyDiagnostics.join('\n')}\n\nStreamed mode\n`
-        : 'Streamed mode\n';
+
+    // Handle Enter key
+    document.getElementById('key-input').addEventListener('keypress', (e) => {
+      if (e.key === 'Enter') document.getElementById('auth-btn').click();
+    });
+
+    document.getElementById('go').addEventListener('click', () => {
+      let val = document.getElementById('url').value.trim();
+      if (!val.startsWith('http')) val = 'https://' + val;
+      
       try {
-        const response = await fetch('/stream/logs', { cache: 'no-store' });
-        diagnostics.textContent += await response.text();
-      } catch (error) {
-        diagnostics.textContent += `Could not load streamed diagnostics: ${error.message}`;
+        const target = new URL(val);
+        const proxyUrl = `${PROXY_URL}/p/${xorEncode(target.origin)}${target.pathname}${target.search}?__k=${sessionToken}`;
+        document.getElementById('frame').src = proxyUrl;
+      } catch (e) {
+        alert("Invalid URL");
       }
-      diagnostics.scrollTop = diagnostics.scrollHeight;
     });
-    async function syncStreamViewport() {
-      if (!streamed) return;
-      const rect = streamView.getBoundingClientRect();
-      const width = Math.max(320, Math.round(rect.width));
-      const height = Math.max(240, Math.round(rect.height));
-      if (Math.abs(width - streamWidth) < 4 && Math.abs(height - streamHeight) < 4) return;
-      try {
-        const response = await fetch('/stream/resize', {
-          method: 'POST', headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ width, height }), cache: 'no-store',
-        });
-        if (!response.ok) return;
-        const size = await response.json();
-        streamWidth = size.width;
-        streamHeight = size.height;
-      } catch { /* retain last successfully applied viewport */ }
-    }
-    new ResizeObserver(() => syncStreamViewport()).observe(streamView);
-    document.addEventListener('fullscreenchange', () => {
-      // In in-page mode the iframe owns fullscreen and focus; only the streamed
-      // viewer needs to be refocused for keyboard relay.
-      if (streamed && document.fullscreenElement === stage) {
-        try { streamView.focus({ preventScroll: true }); } catch { /* focus is best effort */ }
-      }
-      setTimeout(syncStreamViewport, 100);
-    });
-    document.querySelector('#logout').addEventListener('click', async () => {
-      try { await fetch('/logout', { method: 'POST' }); } catch { /* best effort */ }
-      location.reload();
-    });
-    streamStop.addEventListener('click', async () => {
-      if (!streamed) return;
-      await stopStreaming();
-      streamStop.disabled = true;
-      streamPanel.classList.remove('active');
-      if (document.fullscreenElement) document.exitFullscreen().catch(() => {});
-      setStatus('Stopped.');
-    });
-    setInterval(async () => {
-      if (!streamed) return;
-      try {
-        const response = await fetch('/stream/state', { cache: 'no-store' });
-        if (response.ok) {
-          const state = await response.json();
-          if (state.width && state.height && (state.width !== streamWidth || state.height !== streamHeight)) {
-            streamWidth = state.width;
-            streamHeight = state.height;
-          }
-          if (Number.isFinite(state.frames)) frameCount = state.frames;
-          const wantsLocked = Boolean(state.pointerLocked);
-          nativePointerLock = wantsLocked && state.lockMode === 'native';
-          if (wantsLocked !== gamePointerLocked) {
-            gamePointerLocked = wantsLocked;
-            streamPanel.classList.toggle('game-mouse-locked', wantsLocked);
-            if (!wantsLocked) pointerLockDismissed = false;
-            syncLauncherPointerLock();
-          }
-          const wantsFullscreen = Boolean(state.fullscreen);
-          if (wantsFullscreen !== gameWantsFullscreen) {
-            gameWantsFullscreen = wantsFullscreen;
-            syncLauncherFullscreen();
-          }
-        }
-      } catch { /* status can still report the last known frame rate */ }
-      if (Date.now() - lastFpsAt >= 1000) {
-        const now = Date.now();
-        if (frameCount < lastFrameCount) lastFrameCount = frameCount;
-        const fps = Math.max(0, Math.round((frameCount - lastFrameCount) / Math.max(0.2, (now - lastFpsAt) / 1000)));
-        lastFrameCount = frameCount;
-        lastFpsAt = now;
-        if (!statusPinned) setStatus(`Live · ${fps > 0 ? `${fps} frames/s` : 'idle'} · ${document.pointerLockElement ? 'game mouse captured' : (gamePointerLocked ? 'game mouse (click to capture)' : 'normal mouse')}${gameWantsFullscreen ? ' · game full screen' : ''}`);
-      }
-    }, 100);
+
+    // Trigger launch automatically on load
+    document.getElementById('go').click();
   </script>
 </body>
 </html>
