@@ -961,27 +961,25 @@ function rewriteHtml(html, target) {
     const TARGET_BASE = (function(){ const b=TARGET_TOKEN.replace(/-/g,'+').replace(/_/g,'/'); return new TextDecoder().decode(Uint8Array.from(atob(b+'='.repeat((4-b.length%4)%4)),c=>c.charCodeAt(0))); })();
     const REAL_HOSTNAME = window.location.hostname;
     const encode = value => btoa(unescape(encodeURIComponent(value))).replace(/\\+/g,'-').replace(/\\//g,'_').replace(/=+$/g,'');
-    
-    // 1. Spoof window.location so the game thinks it is running on the target domain
+
+    // 1. Spoof Location.prototype (window.location cannot be replaced)
     try {
       const FAKE_URL = new URL(TARGET_BASE);
-      const fakeLocation = new Proxy(window.location, {
-        get: function(target, prop) {
-          if (prop === 'hostname') return FAKE_URL.hostname;
-          if (prop === 'host') return FAKE_URL.host;
-          if (prop === 'origin') return FAKE_URL.origin;
-          if (prop === 'protocol') return FAKE_URL.protocol;
-          if (prop === 'href') return FAKE_URL.href;
-          if (prop === 'toString') return () => FAKE_URL.href;
-          const value = target[prop];
-          if (typeof value === 'function') return value.bind(target);
-          return value;
+      const locProps = ['origin', 'hostname', 'host', 'protocol', 'href', 'port'];
+      locProps.forEach(prop => {
+        const descriptor = Object.getOwnPropertyDescriptor(Location.prototype, prop);
+        if (descriptor && descriptor.get) {
+          Object.defineProperty(Location.prototype, prop, {
+            configurable: true,
+            get: function() {
+              return FAKE_URL[prop];
+            }
+          });
         }
       });
-      Object.defineProperty(window, 'location', { get: () => fakeLocation, configurable: true });
-    } catch (e) { console.warn('Failed to spoof location:', e); }
+    } catch (e) { console.warn('Location spoof failed', e); }
 
-    // 2. Ironclad URL rewriter
+    // 2. Ironclad URL rewriter (prevents double-proxying)
     const proxify = value => {
       if (typeof value !== 'string') value = String(value);
       if (/^(data:|blob:|javascript:|mailto:|tel:|about:)/i.test(value)) return value;
@@ -990,8 +988,11 @@ function rewriteHtml(html, target) {
         if (!['http:','https:'].includes(current.protocol)) return value;
         if (!current.hostname.includes('.')) return value;
 
-        // If it's already a proxy path, leave it alone to prevent double-proxying
-        if (current.pathname.startsWith('/p/')) return current.pathname + current.search;
+        // If it's a proxy path, extract the innermost path to prevent double-proxying
+        if (current.pathname.includes('/p/')) {
+           const idx = current.pathname.lastIndexOf('/p/');
+           return current.pathname.substring(idx) + current.search;
+        }
 
         // If it points to the real proxy host, leave it alone
         if (current.hostname === REAL_HOSTNAME) return current.pathname + current.search;
@@ -1000,7 +1001,6 @@ function rewriteHtml(html, target) {
       } catch { return value; }
     };
     
-    // 3. Patch Network APIs
     const originalFetch = window.fetch.bind(window);
     window.fetch = async function(input, init){
       const request = input instanceof Request ? input : new Request(input, init);
