@@ -154,6 +154,22 @@ function rewriteHtml(html, target) {
       };
     }
 
+    // Intercept dynamically created scripts and links
+    const originalCreateElement = document.createElement.bind(document);
+    document.createElement = function(tagName) {
+      const el = originalCreateElement(tagName);
+      if (tagName.toLowerCase() === 'script' || tagName.toLowerCase() === 'link') {
+        const originalSetAttribute = el.setAttribute;
+        el.setAttribute = function(name, value) {
+          if (name.toLowerCase() === 'src' || name.toLowerCase() === 'href') {
+            value = proxify(value);
+          }
+          return originalSetAttribute.call(el, name, value);
+        };
+      }
+      return el;
+    };
+
     // 4. Patch DOM URLs
     const patchUrlProperty = (prototype, property) => {
       const descriptor = Object.getOwnPropertyDescriptor(prototype, property);
@@ -203,6 +219,10 @@ async function proxyRequest(req, res, target) {
   for (const name of ['content-security-policy', 'x-frame-options', 'content-encoding', 'content-length', 'transfer-encoding', 'connection']) {
     outHeaders.delete(name);
   }
+
+  outHeaders.set('Cross-Origin-Opener-Policy', 'same-origin');
+  outHeaders.set('Cross-Origin-Embedder-Policy', 'credentialless');
+
   outHeaders.set('referrer-policy', 'same-origin');
   outHeaders.set('access-control-allow-origin', '*');
   outHeaders.set('access-control-allow-credentials', 'true');
