@@ -113,7 +113,7 @@
     function proxyUrl(target) {
       const session = window.__PV_SESSION__ || '';
       const sep = target.search ? '&' : '?';
-      return `http://${proxyHost(target.hostname)}:${proxyPort}/p/${toBase64Url(target.href)}${target.pathname}${target.search}${sep}__k=${encodeURIComponent(session)}`;
+      return `/p/${toBase64Url(target.href)}${target.pathname}${target.search}${sep}__k=${encodeURIComponent(session)}`;
     }
 
     function toBase64Url(value) {
