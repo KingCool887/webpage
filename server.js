@@ -1080,14 +1080,13 @@ function responseCookies(response, target) {
       const norm = raw.startsWith('/') ? raw : `/${raw}`;
       return `; Path=${prefix}${norm === '/' ? '' : norm}`;
     });
-    if (/;\s*SameSite=(Lax|Strict)/i.test(out)) {
-      out = out.replace(/;\s*SameSite=(Lax|Strict)/i, '; SameSite=None');
+    // Revert to Lax for local testing, and remove Secure
+    if (/;\s*SameSite=(None|Strict)/i.test(out)) {
+      out = out.replace(/;\s*SameSite=(None|Strict)/i, '; SameSite=Lax');
     } else if (!/;\s*SameSite=/i.test(out)) {
-      out += '; SameSite=None';
+      out += '; SameSite=Lax';
     }
-    if (!/;\s*Secure/i.test(out)) {
-      out += '; Secure';
-    }
+    out = out.replace(/;\s*Secure/i, '');
     return out;
   });
 }
@@ -1321,7 +1320,7 @@ const server = createServer({ timeout: 0 }, async (req, res) => {
       const sameSite = secure ? 'None' : 'Lax';
       res.writeHead(302, {
         'Location': cleanUrl.pathname + cleanUrl.search,
-        'Set-Cookie': `__pv_proxy=${sessionId}; HttpOnly; SameSite=${sameSite}; Path=/; Max-Age=86400${secure}`,
+        'Set-Cookie': `__pv_proxy=${sessionId}; HttpOnly; SameSite=Lax; Path=/; Max-Age=86400`,
         'Cache-Control': 'no-store',
         'Referrer-Policy': 'no-referrer',
         'X-Request-Id': crypto.randomUUID(),
