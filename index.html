@@ -1,121 +1,65 @@
-<!DOCTYPE html>
+<!doctype html>
 <html lang="en">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Game Proxy</title>
+  <meta name="referrer" content="no-referrer">
+  <title>Website Viewer</title>
   <style>
-    :root { color-scheme: dark; font: 14px/1.4 system-ui, sans-serif; background: #000; color: #eef2f8; }
+    :root { color-scheme: dark; font: 14px/1.4 system-ui, sans-serif; background: #0d1118; color: #eef2f8; }
     body { margin: 0; display: flex; flex-direction: column; height: 100vh; overflow: hidden; }
-    
-    /* The Auth Screen */
-    #auth-screen { position: fixed; inset: 0; background: #000; display: flex; flex-direction: column; align-items: center; justify-content: center; z-index: 999; }
-    #auth-box { text-align: center; }
-    #key-input { width: 300px; padding: 12px; margin-bottom: 10px; border-radius: 8px; border: 1px solid #333; background: #111; color: #fff; text-align: center; font-size: 16px; outline: none; }
-    #key-input:focus { border-color: #5b8fd6; }
-    #auth-btn { padding: 12px 24px; border-radius: 8px; border: none; background: #232c3b; color: #fff; cursor: pointer; font-size: 16px; width: 300px; }
-    #auth-btn:hover { background: #2f3a4c; }
-    #auth-error { color: #ff6b6b; margin-top: 10px; height: 20px; font-size: 13px; }
-
-    /* The Launcher UI (Hidden by default) */
-    #app { display: none; flex-direction: column; height: 100%; }
-    #toolbar { display: flex; gap: 8px; padding: 10px; background: #171d28; border-bottom: 1px solid #2a3444; }
-    #url { flex: 1; padding: 8px 14px; border-radius: 999px; border: 1px solid #2f3a4c; background: #0b1017; color: white; }
-    #go { padding: 8px 16px; border-radius: 8px; border: 1px solid #2f3a4c; background: #232c3b; color: white; cursor: pointer; }
-    #frame { flex: 1; border: none; background: #000; width: 100%; height: 100%; }
+    #toolbar { display: flex; align-items: center; gap: 8px; padding: 8px 10px; background: #171d28; border-bottom: 1px solid #2a3444; }
+    #address-form { flex: 1 1 auto; display: flex; min-width: 0; margin: 0; }
+    #address { width: 100%; min-width: 0; padding: 8px 14px; color: inherit; background: #0b1017; border: 1px solid #2f3a4c; border-radius: 999px; font: inherit; }
+    #address:focus { outline: none; border-color: #5b8fd6; }
+    .tool { flex: 0 0 auto; padding: 8px 10px; color: #c3cddc; background: transparent; border: 1px solid transparent; border-radius: 8px; font: inherit; cursor: pointer; }
+    .tool:hover { background: #232c3b; border-color: #2f3a4c; }
+    #stage { position: relative; flex: 1 1 auto; min-height: 0; display: flex; background: #05070a; }
+    #viewer { display: block; flex: 1 1 auto; width: 100%; height: 100%; border: 0; background: #0b0f16; }
   </style>
 </head>
 <body>
-
-  <!-- AUTH SCREEN -->
-  <div id="auth-screen">
-    <div id="auth-box">
-      <input id="key-input" type="password" placeholder="Enter Access Key" autocomplete="off">
-      <button id="auth-btn">Unlock</button>
-      <div id="auth-error"></div>
-    </div>
-  </div>
-
-  <!-- LAUNCHER (Hidden) -->
-  <div id="app">
-    <div id="toolbar">
-      <input id="url" type="text" placeholder="Enter website address (e.g., deadshot.io)" value="deadshot.io">
-      <button id="go">Launch</button>
-    </div>
-    <iframe id="frame" allow="autoplay; fullscreen; gamepad; clipboard-read; clipboard-write; identity-credentials-get" referrerpolicy="no-referrer"></iframe>
-  </div>
-
+  <header id="toolbar">
+    <form id="address-form" autocomplete="off">
+      <input id="address" name="address" type="text" inputmode="url" placeholder="Enter a website address (e.g., deadshot.io)" aria-label="Website address" autocomplete="off" spellcheck="false" value="deadshot.io">
+    </form>
+    <button id="launch-btn" class="tool" type="button">Launch</button>
+  </header>
+  <main id="stage">
+    <iframe id="viewer" title="Website view" allow="autoplay; fullscreen; gamepad; clipboard-read; clipboard-write; identity-credentials-get" referrerpolicy="no-referrer"></iframe>
+  </main>
   <script>
-    // ==========================================
-    // CONFIGURATION - UPDATE THIS WITH YOUR RENDER URL
-    // ==========================================
-    const PROXY_URL = "https://webpage-50r9.onrender.com";
-    // ==========================================
+    window.__PV_SESSION__ = "__PV_SESSION_JSON__";
+    const address = document.querySelector('#address');
+    const viewer = document.querySelector('#viewer');
+    const proxyPort = __PROXY_PORT__;
 
-    // XOR Obfuscation (must match server.js)
-    const XOR_KEY = "GhostProxy2026";
-    const xorEncode = (str) => {
-      let bin = "";
-      for (let i = 0; i < str.length; i++) {
-        bin += String.fromCharCode(str.charCodeAt(i) ^ XOR_KEY.charCodeAt(i % XOR_KEY.length));
-      }
-      return btoa(bin).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
-    };
+    function toBase64Url(value) {
+      const bytes = new TextEncoder().encode(value);
+      let binary = '';
+      for (const byte of bytes) binary += String.fromCharCode(byte);
+      return btoa(binary).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/g, '');
+    }
 
-    let sessionToken = null;
+    function proxyUrl(target) {
+      const session = window.__PV_SESSION__ || '';
+      const sep = target.search ? '&' : '?';
+      return `/p/${toBase64Url(target.href)}${target.pathname}${target.search}${sep}__k=${encodeURIComponent(session)}`;
+    }
 
-    document.getElementById('auth-btn').addEventListener('click', async () => {
-      const key = document.getElementById('key-input').value.trim();
-      const errorDiv = document.getElementById('auth-error');
-      const btn = document.getElementById('auth-btn');
-
-      if (!key) return;
-      btn.textContent = 'Verifying...';
-      errorDiv.textContent = '';
-
-      try {
-        const res = await fetch(`${PROXY_URL}/api/auth`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ key })
-        });
-        
-        const data = await res.json();
-        
-        if (res.ok) {
-          sessionToken = data.token;
-          document.getElementById('auth-screen').style.display = 'none';
-          document.getElementById('app').style.display = 'flex';
-        } else {
-          errorDiv.textContent = data.error || 'Invalid key.';
-          btn.textContent = 'Unlock';
-        }
-      } catch (e) {
-        errorDiv.textContent = 'Connection failed.';
-        btn.textContent = 'Unlock';
-      }
-    });
-
-    // Handle Enter key
-    document.getElementById('key-input').addEventListener('keypress', (e) => {
-      if (e.key === 'Enter') document.getElementById('auth-btn').click();
-    });
-
-    document.getElementById('go').addEventListener('click', () => {
-      let val = document.getElementById('url').value.trim();
+    document.querySelector('#launch-btn').addEventListener('click', () => {
+      let val = address.value.trim();
       if (!val.startsWith('http')) val = 'https://' + val;
-      
       try {
         const target = new URL(val);
-        const proxyUrl = `${PROXY_URL}/p/${xorEncode(target.origin)}${target.pathname}${target.search}?__k=${sessionToken}`;
-        document.getElementById('frame').src = proxyUrl;
+        viewer.src = proxyUrl(target);
       } catch (e) {
         alert("Invalid URL");
       }
     });
 
-    // Trigger launch automatically on load
-    document.getElementById('go').click();
+    // Auto-launch on load for testing
+    document.querySelector('#launch-btn').click();
   </script>
 </body>
 </html>
