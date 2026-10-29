@@ -11,11 +11,8 @@ const { lookup } = require('node:dns/promises');
 const { Readable } = require('node:stream');
 
 const HOST = '127.0.0.1';
-const BIND_ADDRESS = process.env.BIND_ADDRESS || '127.0.0.1';
-const LAUNCHER_HOST = 'launcher.localhost';
-const PORT = Number(process.env.PORT || 8787);
-const PROXY_PORT = Number(process.env.PROXY_PORT || PORT + 1);
-const PARTY_PORT = PROXY_PORT + 1;
+const BIND_ADDRESS = process.env.BIND_ADDRESS || '0.0.0.0';
+const PORT = Number(process.env.PORT || 8787); // Single port for everything
 const PAGE_PATH = path.join(__dirname, 'index.html');
 const TOKEN_PATH = path.join(__dirname, '.proxy-token');
 const STREAM_DIAGNOSTICS_PATH = path.join(__dirname, 'stream-diagnostics.log');
@@ -134,7 +131,7 @@ function streamDiagnostic(sessionId, message) {
 }
 
 function logProxy(method, target, status, detail = '') {
-  const safeTarget = `${proxyHostname(target.hostname)}:${PROXY_PORT}`;
+  const safeTarget = `${proxyHostname(target.hostname)}`;
   const suffix = detail ? ` ${detail}` : '';
   console.log(`[proxy ${new Date().toISOString()}] ${method} ${safeTarget} -> ${status}${suffix}`);
 }
@@ -412,7 +409,7 @@ function send(res, status, body, type = 'text/plain; charset=utf-8') {
     'Cache-Control': 'no-store',
     'X-Content-Type-Options': 'nosniff',
     'Referrer-Policy': 'no-referrer',
-    'Content-Security-Policy': `default-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline'; connect-src 'self'; frame-src ${scheme}://*.localhost:${PROXY_PORT}; form-action 'self'; base-uri 'none'; frame-ancestors ${FRAME_ANCESTORS}`,
+    'Content-Security-Policy': `default-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline'; connect-src 'self'; frame-src ${scheme}://*.localhost:${PORT}; form-action 'self'; base-uri 'none'; frame-ancestors ${FRAME_ANCESTORS}`,
   };
   if (tlsOptions) headers['Strict-Transport-Security'] = 'max-age=31536000';
   res.writeHead(status, headers);
@@ -906,7 +903,7 @@ async function validatePublicTarget(target) {
 }
 
 function proxyPath(target) {
-  return `http://${proxyHostname(target.hostname)}:${PROXY_PORT}/p/${encodeTarget(target.origin)}${target.pathname}${target.search}`;
+  return `/p/${encodeTarget(target.origin)}${target.pathname}${target.search}`;
 }
 
 function proxyHostname(hostname) {
@@ -915,7 +912,7 @@ function proxyHostname(hostname) {
     hash ^= BigInt(character.charCodeAt(0));
     hash = BigInt.asUintN(64, hash * 1099511628211n);
   }
-  return `p-${hash.toString(36)}.localhost`;
+  return `p-${hash.toString(36)}`;
 }
 
 function resolveLink(value, base) {
@@ -937,7 +934,6 @@ function rewriteCss(css, base) {
 }
 
 function rewriteHtml(html, target) {
-  const proxyBase = `http://${proxyHostname(target.hostname)}:${PROXY_PORT}`;
   const attrNames = ['href', 'src', 'action', 'formaction', 'poster', 'data', 'xlink:href'];
   const attrPattern = new RegExp(`(\\b(?:${attrNames.join('|')})\\s*=\\s*)(["'])(.*?)\\2`, 'gis');
   let rewritten = html.replace(attrPattern, (match, prefix, quote, value) => `${prefix}${quote}${resolveLink(value, target)}${quote}`);
@@ -958,18 +954,8 @@ function rewriteHtml(html, target) {
   const runtime = PROXY_DIAGNOSTICS_AGENT + `<script>(function(){
     const TARGET_TOKEN = ${JSON.stringify(encodeTarget(target.origin))};
     const TARGET_BASE = (function(){ const b=TARGET_TOKEN.replace(/-/g,'+').replace(/_/g,'/'); return new TextDecoder().decode(Uint8Array.from(atob(b+'='.repeat((4-b.length%4)%4)),c=>c.charCodeAt(0))); })();
-    const PROXY_BASE = ${JSON.stringify(proxyBase)};
     const proxyOrigins = new Map();
-    proxyOrigins.set(new URL(PROXY_BASE).hostname, new URL(TARGET_BASE).origin);
     const encode = value => btoa(unescape(encodeURIComponent(value))).replace(/\\+/g,'-').replace(/\\//g,'_').replace(/=+$/g,'');
-    const proxyHost = hostname => {
-      let hash = 14695981039346656037n;
-      for (const character of hostname.toLowerCase()) {
-        hash ^= BigInt(character.charCodeAt(0));
-        hash = BigInt.asUintN(64, hash * 1099511628211n);
-      }
-      return 'p-' + hash.toString(36) + '.localhost';
-    };
     const proxify = value => {
       if (typeof value !== 'string') value = String(value);
       if (/^(data:|blob:|javascript:|mailto:|tel:|about:)/i.test(value)) return value;
@@ -977,15 +963,13 @@ function rewriteHtml(html, target) {
         let current = new URL(value, TARGET_BASE);
         if (!['http:','https:'].includes(current.protocol)) return value;
         if (!current.hostname.includes('.')) return value;
-        if (current.hostname.endsWith('.localhost') && Number(current.port) === ${PROXY_PORT}) {
+        if (current.hostname.endsWith('.localhost') && Number(current.port) === ${PORT}) {
           if (current.pathname.startsWith('/p/')) return current.href;
           const actualOrigin = proxyOrigins.get(current.hostname);
           if (!actualOrigin) return value;
           current = new URL(current.pathname + current.search + current.hash, actualOrigin);
         }
-        const localHost = proxyHost(current.hostname);
-        proxyOrigins.set(localHost, current.origin);
-        return 'http://' + localHost + ':${PROXY_PORT}/p/' + encode(current.origin) + current.pathname + current.search;
+        return '/p/' + encode(current.origin) + current.pathname + current.search;
       } catch { return value; }
     };
     const originalFetch = window.fetch.bind(window);
@@ -1101,20 +1085,6 @@ function targetFromRequest(req, parsedPath) {
     else if (match[2] === '/') target.pathname = '/';
     return target;
   }
-
-  const referer = req.headers.referer;
-  if (referer) {
-    try {
-      const localReferer = new URL(referer);
-      if (localReferer.hostname.endsWith('.localhost') && Number(localReferer.port) === PROXY_PORT) {
-        const parentMatch = localReferer.pathname.match(/^\/p\/([A-Za-z0-9_-]+)(\/.*)?$/);
-        if (parentMatch) {
-          const parent = decodeTarget(parentMatch[1]);
-          return new URL(`${parsedPath.pathname}${cleanSearchOnly(parsedPath.search)}`, parent);
-        }
-      }
-    } catch { /* ignored */ }
-  }
   return null;
 }
 
@@ -1126,7 +1096,7 @@ function mapReferer(value) {
   if (!value) return undefined;
   try {
     const parsed = new URL(value);
-    if (parsed.hostname.endsWith('.localhost') && Number(parsed.port) === PROXY_PORT) {
+    if (parsed.hostname.endsWith('.localhost') && Number(parsed.port) === PORT) {
       const match = parsed.pathname.match(/^\/p\/([A-Za-z0-9_-]+)(\/.*)?$/);
       if (match) return decodeTarget(match[1]).href;
     }
@@ -1136,7 +1106,6 @@ function mapReferer(value) {
 
 async function proxyRequest(req, res, target, sessionId) {
   await validatePublicTarget(target);
-  proxyHostTargets.set(proxyHostname(target.hostname), target.origin);
   const headers = new Headers();
   for (const [name, value] of Object.entries(req.headers)) {
     const lower = name.toLowerCase();
@@ -1178,9 +1147,9 @@ async function proxyRequest(req, res, target, sessionId) {
   ]) outHeaders.delete(name);
   if (/text\/html|application\/xhtml\+xml/i.test(upstreamContentType)) outHeaders.set('cache-control', 'no-store');
   outHeaders.set('referrer-policy', 'same-origin');
-  const requestOrigin = req.headers.origin || `http://${proxyHostname(target.hostname)}:${PROXY_PORT}`;
-  if (/^http:\/\/[a-z0-9.:-]+\.localhost:\d+$/i.test(requestOrigin)) outHeaders.set('access-control-allow-origin', requestOrigin);
-  else outHeaders.set('access-control-allow-origin', `http://${proxyHostname(target.hostname)}:${PROXY_PORT}`);
+  const requestOrigin = req.headers.origin || `http://${req.headers.host}`;
+  if (/^https?:\/\/[a-z0-9.:-]+$/i.test(requestOrigin)) outHeaders.set('access-control-allow-origin', requestOrigin);
+  else outHeaders.set('access-control-allow-origin', `http://${req.headers.host}`);
   outHeaders.set('access-control-allow-credentials', 'true');
   outHeaders.set('access-control-allow-methods', 'GET,HEAD,POST,PUT,PATCH,DELETE,OPTIONS');
   const requestedHeaders = req.headers['access-control-request-headers'];
@@ -1256,7 +1225,7 @@ async function readJsonBody(req, limit = 8192) {
 }
 
 // ---------------------------------------------------------------------------
-// Servers
+// Unified Server
 // ---------------------------------------------------------------------------
 
 function createServer(options, handler) {
@@ -1264,21 +1233,118 @@ function createServer(options, handler) {
   return http.createServer(options, handler);
 }
 
-const launcher = createServer(async (req, res) => {
-  const origin = req.headers.origin;
-  if (origin && ![`http://${HOST}:${PORT}`, `http://${LAUNCHER_HOST}:${PORT}`].includes(origin)) {
-    return send(res, 403, 'This local launcher only accepts its own page.');
-  }
-  let launcherUrl;
-  try { launcherUrl = new URL(req.url, `http://${HOST}:${PORT}`); }
-  catch { return send(res, 400, 'Invalid launcher path.'); }
-  const launcherPath = launcherUrl.pathname;
-  const ip = getClientIp(req);
+const server = createServer({ timeout: 0 }, async (req, res) => {
+  let local;
+  try { local = new URL(req.url, `http://${HOST}:${PORT}`); }
+  catch { return res.writeHead(400).end('Invalid request.'); }
 
+  const ip = getClientIp(req);
   if (isAuthBanned(ip)) return forbidden(res);
 
-  if (req.method === 'GET' && launcherPath === '/' && launcherUrl.searchParams.has('k')) {
-    const provided = launcherUrl.searchParams.get('k') || '';
+  // ROUTING: Proxy Path
+  if (local.pathname.startsWith('/p/') || local.pathname.startsWith('/_ws/')) {
+    if (req.method === 'OPTIONS') {
+      const preflight = takeToken(`preflight:${ip}`, 30, 60, 300000);
+      if (preflight.banned || !preflight.ok) return rateLimited(res, preflight.retryAfter || 1);
+      const requestedOrigin = req.headers.origin;
+      let allowOrigin = `http://${req.headers.host}`;
+      if (requestedOrigin) {
+        try {
+          const parsedOrigin = new URL(requestedOrigin);
+          allowOrigin = requestedOrigin;
+        } catch { /* use default */ }
+      }
+      res.writeHead(204, {
+        'Access-Control-Allow-Origin': allowOrigin,
+        'Access-Control-Allow-Credentials': 'true',
+        'Access-Control-Allow-Methods': 'GET,HEAD,POST,PUT,PATCH,DELETE,OPTIONS',
+        'Access-Control-Allow-Headers': req.headers['access-control-request-headers'] || '*',
+        'Access-Control-Max-Age': '600',
+        'Vary': 'Origin',
+      });
+      return res.end();
+    }
+
+    const auth = authenticateProxy(req, local);
+    if (!auth) return sendUnauthorized(res, 'Authentication required.');
+
+    const limit = takeToken(`proxy:${auth.session.token}`, 60, 120, 600000);
+    if (limit.banned || !limit.ok) return rateLimited(res, limit.retryAfter || 1);
+
+    let target;
+    try { target = targetFromRequest(req, local); }
+    catch (error) {
+      logProxyRouteFailure(req, 400, error.message);
+      return res.writeHead(400).end(error.message);
+    }
+    if (!target) {
+      logProxyRouteFailure(req, 404, 'no target token');
+      return res.writeHead(404).end('No target is associated with this request.');
+    }
+
+    const sessionId = auth.session.token;
+
+    if (auth.source === 'query' && req.method === 'GET') {
+      const cleanUrl = new URL(req.url, `http://${HOST}:${PORT}`);
+      cleanUrl.searchParams.delete('__k');
+      const isLocalhost = String(req.headers.host || '').includes('localhost') || String(req.headers.host || '').includes('127.0.0.1');
+      const secure = (req.socket.encrypted || isLocalhost) ? '; Secure' : '';
+      const sameSite = secure ? 'None' : 'Lax';
+      res.writeHead(302, {
+        'Location': cleanUrl.pathname + cleanUrl.search,
+        'Set-Cookie': `__pv_proxy=${sessionId}; HttpOnly; SameSite=${sameSite}; Path=/; Max-Age=86400${secure}`,
+        'Cache-Control': 'no-store',
+        'Referrer-Policy': 'no-referrer',
+        'X-Request-Id': crypto.randomUUID(),
+      });
+      return res.end();
+    }
+
+    const requestStarted = Date.now();
+    let responseBytes = 0;
+    const originalWrite = res.write.bind(res);
+    const originalEnd = res.end.bind(res);
+    res.write = (chunk, encoding, callback) => {
+      const size = responseChunkSize(chunk, encoding);
+      responseBytes += size;
+      if (!checkBytes(sessionId, size)) { res.destroy(); return false; }
+      return originalWrite(chunk, encoding, callback);
+    };
+    res.end = (chunk, encoding, callback) => {
+      if (chunk) {
+        const size = responseChunkSize(chunk, encoding);
+        responseBytes += size;
+        checkBytes(sessionId, size);
+      }
+      return originalEnd(chunk, encoding, callback);
+    };
+    res.once('finish', () => {
+      if (PROXY_LOG_MODE === 'all' || res.statusCode >= 400) {
+        const type = res.proxyContentType || 'no-content-type';
+        logProxy(req.method, target, res.statusCode, `${Date.now() - requestStarted}ms ${responseBytes}B ${type} sid=${sessionId.slice(0, 8)}${res.proxyError ? ` error=${res.proxyError}` : ''}`);
+      }
+    });
+
+    return proxyRequest(req, res, target, sessionId).catch((error) => {
+      console.error(`[proxy] ${proxyHostname(target.hostname)} -> ${error.name || 'Error'}${error.cause?.code ? `/${error.cause.code}` : ''} sid=${sessionId.slice(0, 8)}`);
+      res.proxyError = `${error.name || 'Error'}${error.cause?.code ? `/${error.cause.code}` : ''}`;
+      let allowOrigin = `http://${req.headers.host}`;
+      if (req.headers.origin) allowOrigin = req.headers.origin;
+      if (!res.headersSent && !res.destroyed) res.writeHead(error.name === 'TimeoutError' ? 504 : 502, {
+        'Content-Type': 'text/plain; charset=utf-8',
+        'Cache-Control': 'no-store',
+        'Access-Control-Allow-Origin': allowOrigin,
+        'Access-Control-Allow-Credentials': 'true',
+        'Access-Control-Allow-Headers': '*',
+        'X-Request-Id': crypto.randomUUID(),
+      });
+      if (!res.destroyed) res.end(error.message || 'The website could not be loaded through the local proxy.');
+    });
+  }
+
+  // ROUTING: Launcher
+  if (req.method === 'GET' && local.pathname === '/' && local.searchParams.has('k')) {
+    const provided = local.searchParams.get('k') || '';
     if (!timingSafeEqualStr(provided, PROXY_TOKEN)) {
       console.log(`[auth] master token rejected ip=${ip}`);
       recordAuthFailure(ip);
@@ -1298,7 +1364,7 @@ const launcher = createServer(async (req, res) => {
     return res.end();
   }
 
-  if (req.method === 'POST' && launcherPath === '/logout') {
+  if (req.method === 'POST' && local.pathname === '/logout') {
     const authSession = getSessionFromCookie(req.headers.cookie, '__pv_auth');
     if (authSession) {
       sessions.delete(authSession.token);
@@ -1315,34 +1381,36 @@ const launcher = createServer(async (req, res) => {
 
   const authSession = getSessionFromCookie(req.headers.cookie, '__pv_auth');
   if (!authSession) {
-    console.log(`[auth] unauthenticated ${req.method} ${launcherPath} ip=${ip}`);
+    if (!local.pathname.match(/\.(ico|png|jpg|css|js)$/)) {
+      console.log(`[auth] unauthenticated ${req.method} ${local.pathname} ip=${ip}`);
+    }
     return sendUnauthorized(res, 'Authentication required.');
   }
 
   const launcherLimit = takeToken(`launcher:${authSession.token}`, 20, 40, 300000);
   if (launcherLimit.banned || !launcherLimit.ok) return rateLimited(res, launcherLimit.retryAfter || 1);
 
-  if (req.method === 'GET' && (launcherPath === '/' || launcherPath === '/index.html')) {
+  if (req.method === 'GET' && (local.pathname === '/' || local.pathname === '/index.html')) {
     try {
-      let page = fs.readFileSync(PAGE_PATH, 'utf8').replaceAll('__PROXY_PORT__', String(PROXY_PORT));
+      let page = fs.readFileSync(PAGE_PATH, 'utf8').replaceAll('__PROXY_PORT__', String(PORT));
       page = page.replace('__PV_SESSION_JSON__', JSON.stringify(authSession.token));
       return send(res, 200, page, 'text/html; charset=utf-8');
     } catch { return send(res, 500, 'Could not read index.html.'); }
   }
 
-  if (req.method === 'GET' && launcherPath === '/stream/logs') {
+  if (req.method === 'GET' && local.pathname === '/stream/logs') {
     if (!DEBUG) return send(res, 404, 'Not found.');
     let logs = 'No streamed-browser diagnostics yet. Start a streamed session first.';
     try { logs = fs.readFileSync(STREAM_DIAGNOSTICS_PATH, 'utf8'); } catch { /* no session started */ }
     return send(res, 200, logs, 'text/plain; charset=utf-8');
   }
 
-  if (req.method === 'GET' && launcherPath === '/favicon.ico') {
+  if (req.method === 'GET' && local.pathname === '/favicon.ico') {
     res.writeHead(204, { 'Cache-Control': 'no-store' });
     return res.end();
   }
 
-  if (req.method === 'POST' && launcherPath === '/stream/start') {
+  if (req.method === 'POST' && local.pathname === '/stream/start') {
     if (req.headers['content-type']?.split(';')[0] !== 'application/json') return send(res, 415, 'Expected JSON.');
     try {
       const body = await readJsonBody(req);
@@ -1357,13 +1425,13 @@ const launcher = createServer(async (req, res) => {
     }
   }
 
-  if (req.method === 'POST' && launcherPath === '/stream/stop') {
+  if (req.method === 'POST' && local.pathname === '/stream/stop') {
     if (!streamSessions.has(authSession.token)) return send(res, 404, 'No stream for this session.');
     await stopStream(authSession.token);
     return send(res, 200, 'Stopped.');
   }
 
-  if (req.method === 'POST' && launcherPath === '/stream/resize') {
+  if (req.method === 'POST' && local.pathname === '/stream/resize') {
     const session = streamSessions.get(authSession.token);
     if (!session) return send(res, 404, 'No stream for this session.');
     try {
@@ -1389,7 +1457,7 @@ const launcher = createServer(async (req, res) => {
     }
   }
 
-  if (req.method === 'GET' && launcherPath === '/stream/state') {
+  if (req.method === 'GET' && local.pathname === '/stream/state') {
     const session = streamSessions.get(authSession.token);
     if (!session) return send(res, 404, 'No stream for this session.');
     try {
@@ -1418,7 +1486,7 @@ const launcher = createServer(async (req, res) => {
     }
   }
 
-  if (req.method === 'POST' && launcherPath === '/stream/input') {
+  if (req.method === 'POST' && local.pathname === '/stream/input') {
     const session = streamSessions.get(authSession.token);
     if (!session) return send(res, 404, 'No stream for this session.');
     if (req.headers['content-type']?.split(';')[0] !== 'application/json') return send(res, 415, 'Expected JSON.');
@@ -1433,7 +1501,7 @@ const launcher = createServer(async (req, res) => {
     }
   }
 
-  if (req.method === 'GET' && launcherPath === '/stream') {
+  if (req.method === 'GET' && local.pathname === '/stream') {
     const session = streamSessions.get(authSession.token);
     if (!session) return send(res, 404, 'No stream for this session.');
     res.writeHead(200, {
@@ -1454,121 +1522,6 @@ const launcher = createServer(async (req, res) => {
   }
 
   return send(res, 404, 'Not found.');
-});
-
-const proxy = createServer({ timeout: 0 }, async (req, res) => {
-  let local;
-  try { local = new URL(req.url, `http://${HOST}:${PROXY_PORT}`); }
-  catch { return res.writeHead(400).end('Invalid request.'); }
-
-  const ip = getClientIp(req);
-  if (isAuthBanned(ip)) return forbidden(res);
-
-  if (req.method === 'OPTIONS') {
-    const preflight = takeToken(`preflight:${ip}`, 30, 60, 300000);
-    if (preflight.banned || !preflight.ok) return rateLimited(res, preflight.retryAfter || 1);
-    const requestedOrigin = req.headers.origin;
-    let allowOrigin = `http://${HOST}:${PROXY_PORT}`;
-    if (requestedOrigin) {
-      try {
-        const parsedOrigin = new URL(requestedOrigin);
-        if (parsedOrigin.protocol === 'http:' && Number(parsedOrigin.port) === PROXY_PORT && parsedOrigin.hostname.endsWith('.localhost')) allowOrigin = requestedOrigin;
-      } catch { /* use default */ }
-    }
-    res.writeHead(204, {
-      'Access-Control-Allow-Origin': allowOrigin,
-      'Access-Control-Allow-Credentials': 'true',
-      'Access-Control-Allow-Methods': 'GET,HEAD,POST,PUT,PATCH,DELETE,OPTIONS',
-      'Access-Control-Allow-Headers': req.headers['access-control-request-headers'] || '*',
-      'Access-Control-Max-Age': '600',
-      'Vary': 'Origin',
-    });
-    return res.end();
-  }
-
-  const auth = authenticateProxy(req, local);
-  if (!auth) {
-    return sendUnauthorized(res, 'Authentication required.');
-  }
-
-  const limit = takeToken(`proxy:${auth.session.token}`, 60, 120, 600000);
-  if (limit.banned || !limit.ok) return rateLimited(res, limit.retryAfter || 1);
-
-  let target;
-  try { target = targetFromRequest(req, local); }
-  catch (error) {
-    logProxyRouteFailure(req, 400, error.message);
-    return res.writeHead(400).end(error.message);
-  }
-  if (!target) {
-    logProxyRouteFailure(req, 404, 'no target token or usable Referer');
-    return res.writeHead(404).end('No target is associated with this request.');
-  }
-
-  const sessionId = auth.session.token;
-
-  if (auth.source === 'query' && req.method === 'GET') {
-    const cleanUrl = new URL(req.url, `http://${HOST}:${PROXY_PORT}`);
-    cleanUrl.searchParams.delete('__k');
-    const hostname = String(req.headers.host || '').split(':')[0];
-    const isLocalhost = hostname.endsWith('localhost') || hostname === '127.0.0.1';
-    const secure = (req.socket.encrypted || isLocalhost) ? '; Secure' : '';
-    const sameSite = secure ? 'None' : 'Lax';
-    res.writeHead(302, {
-      'Location': cleanUrl.pathname + cleanUrl.search,
-      'Set-Cookie': `__pv_proxy=${sessionId}; HttpOnly; SameSite=${sameSite}; Path=/; Max-Age=86400${secure}`,
-      'Cache-Control': 'no-store',
-      'Referrer-Policy': 'no-referrer',
-      'X-Request-Id': crypto.randomUUID(),
-    });
-    return res.end();
-  }
-
-  const requestStarted = Date.now();
-  let responseBytes = 0;
-  const originalWrite = res.write.bind(res);
-  const originalEnd = res.end.bind(res);
-  res.write = (chunk, encoding, callback) => {
-    const size = responseChunkSize(chunk, encoding);
-    responseBytes += size;
-    if (!checkBytes(sessionId, size)) { res.destroy(); return false; }
-    return originalWrite(chunk, encoding, callback);
-  };
-  res.end = (chunk, encoding, callback) => {
-    if (chunk) {
-      const size = responseChunkSize(chunk, encoding);
-      responseBytes += size;
-      checkBytes(sessionId, size);
-    }
-    return originalEnd(chunk, encoding, callback);
-  };
-  res.once('finish', () => {
-    if (PROXY_LOG_MODE === 'all' || res.statusCode >= 400) {
-      const type = res.proxyContentType || 'no-content-type';
-      logProxy(req.method, target, res.statusCode, `${Date.now() - requestStarted}ms ${responseBytes}B ${type} sid=${sessionId.slice(0, 8)}${res.proxyError ? ` error=${res.proxyError}` : ''}`);
-    }
-  });
-
-  proxyRequest(req, res, target, sessionId).catch((error) => {
-    console.error(`[proxy] ${proxyHostname(target.hostname)} -> ${error.name || 'Error'}${error.cause?.code ? `/${error.cause.code}` : ''} sid=${sessionId.slice(0, 8)}`);
-    res.proxyError = `${error.name || 'Error'}${error.cause?.code ? `/${error.cause.code}` : ''}`;
-    let allowOrigin = `http://${proxyHostname(target.hostname)}:${PROXY_PORT}`;
-    if (req.headers.origin) {
-      try {
-        const parsed = new URL(req.headers.origin);
-        if (parsed.protocol === 'http:' && Number(parsed.port) === PROXY_PORT && parsed.hostname.endsWith('.localhost')) allowOrigin = req.headers.origin;
-      } catch { /* use default */ }
-    }
-    if (!res.headersSent && !res.destroyed) res.writeHead(error.name === 'TimeoutError' ? 504 : 502, {
-      'Content-Type': 'text/plain; charset=utf-8',
-      'Cache-Control': 'no-store',
-      'Access-Control-Allow-Origin': allowOrigin,
-      'Access-Control-Allow-Credentials': 'true',
-      'Access-Control-Allow-Headers': '*',
-      'X-Request-Id': crypto.randomUUID(),
-    });
-    if (!res.destroyed) res.end(error.message || 'The website could not be loaded through the local proxy.');
-  });
 });
 
 async function relayUpgrade(req, client, head, target, originOverride, sessionId, extraHeaders) {
@@ -1643,7 +1596,6 @@ async function relayUpgrade(req, client, head, target, originOverride, sessionId
     upstream.removeListener('data', onUpstreamData);
 
     if (target.hostname.startsWith('party.')) {
-      const captureHost = String(req.headers.host || '').split(':')[0].toLowerCase();
       const pageHost = proxyHostname(target.hostname.replace(/^party\./, ''));
       const needle = Buffer.from([0xa2, 0x69, 0x70, 0xd9, 0x20]);
       let tail = Buffer.alloc(0);
@@ -1653,7 +1605,6 @@ async function relayUpgrade(req, client, head, target, originOverride, sessionId
         while ((idx = combined.indexOf(needle, idx)) !== -1) {
           const hex = combined.slice(idx + needle.length, idx + needle.length + 32).toString('ascii');
           if (/^[0-9a-f]{32}$/.test(hex)) {
-            lastMatchIpByPageHost.set(`${sessionId}:${captureHost}`, hex);
             lastMatchIpByPageHost.set(`${sessionId}:${pageHost}`, hex);
             console.log(`[proxy] captured match ip ${hex.slice(0, 8)}... sid=${sessionId.slice(0, 8)}`);
           }
@@ -1674,9 +1625,9 @@ async function relayUpgrade(req, client, head, target, originOverride, sessionId
   client.on('error', () => upstream.destroy());
 }
 
-proxy.on('upgrade', async (req, client, head) => {
+server.on('upgrade', async (req, client, head) => {
   let local;
-  try { local = new URL(req.url, `http://${HOST}:${PROXY_PORT}`); }
+  try { local = new URL(req.url, `http://${HOST}:${PORT}`); }
   catch { client.write('HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n'); return client.destroy(); }
 
   const ip = getClientIp(req);
@@ -1717,14 +1668,19 @@ proxy.on('upgrade', async (req, client, head) => {
         try { originForUpgrade = Buffer.from(o, 'base64url').toString('utf8'); } catch { /* keep undefined */ }
       }
       await validatePublicTarget(target);
-    } else {
-      const host = String(req.headers.host || '').split(':')[0].toLowerCase();
-      const pageOrigin = proxyHostTargets.get(host);
-      if (!pageOrigin) throw new Error('Unknown page host.');
+    } else if (local.pathname === '/ws') {
+      let pageOrigin;
+      if (req.headers.referer) {
+        const refererPath = new URL(req.headers.referer).pathname;
+        const pageMatch = refererPath.match(/^\/p\/([A-Za-z0-9_-]+)(\/.*)?$/);
+        if (pageMatch) pageOrigin = decodeTarget(pageMatch[1]).origin;
+      }
+      if (!pageOrigin) throw new Error('Unknown page origin for /ws.');
+
       const page = new URL(pageOrigin);
       const cleanSearch = stripKParam(local.search);
 
-      const storedMatchIp = lastMatchIpByPageHost.get(`${sessionId}:${host}`);
+      const storedMatchIp = lastMatchIpByPageHost.get(`${sessionId}:${proxyHostname(page.hostname)}`);
       if (storedMatchIp && local.pathname === '/ws' && cleanSearch) {
         target = new URL(`wss://ip_${storedMatchIp}.${page.hostname}${local.pathname}${cleanSearch}`);
         originForUpgrade = page.origin;
@@ -1735,6 +1691,8 @@ proxy.on('upgrade', async (req, client, head) => {
         originForUpgrade = page.origin;
       }
       await validatePublicTarget(target);
+    } else {
+      throw new Error('Unknown WS path.');
     }
   } catch (error) {
     console.log(`[proxy] WS upgrade rejected: ${error.message || error} sid=${sessionId.slice(0, 8)}`);
@@ -1764,75 +1722,6 @@ proxy.on('upgrade', async (req, client, head) => {
   client.once('close', () => {
     if (PROXY_LOG_MODE === 'all') console.log(`[proxy] WS closed sid=${sessionId.slice(0, 8)} duration=${Date.now() - startTime}ms`);
   });
-});
-
-const party = createServer({ timeout: 0 }, (req, res) => {
-  res.writeHead(404, { 'Content-Type': 'text/plain; charset=utf-8', 'Cache-Control': 'no-store' });
-  res.end('No route on the party port.');
-});
-
-party.on('upgrade', async (req, client, head) => {
-  let local;
-  try { local = new URL(req.url, `http://${HOST}:${PARTY_PORT}`); }
-  catch { client.write('HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n'); return client.destroy(); }
-
-  const ip = getClientIp(req);
-  if (isAuthBanned(ip)) {
-    client.write('HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n');
-    return client.destroy();
-  }
-
-  const auth = authenticateProxy(req, local);
-  if (!auth) {
-    console.log(`[auth] party WS unauthenticated ip=${ip}`);
-    client.write('HTTP/1.1 401 Unauthorized\r\nConnection: close\r\n\r\n');
-    return client.destroy();
-  }
-
-  const limit = takeToken(`proxy:${auth.session.token}`, 60, 120, 600000);
-  if (limit.banned || !limit.ok) {
-    client.write(`HTTP/1.1 429 Too Many Requests\r\nRetry-After: ${limit.retryAfter || 1}\r\nConnection: close\r\n\r\n`);
-    return client.destroy();
-  }
-
-  if (auth.session.wsCount >= MAX_WS_PER_SESSION) {
-    client.write('HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\n\r\n');
-    return client.destroy();
-  }
-
-  const sessionId = auth.session.token;
-  try {
-    const host = String(req.headers.host || '').split(':')[0].toLowerCase();
-    const pageOrigin = proxyHostTargets.get(host);
-    if (!pageOrigin) throw new Error('Unknown page host.');
-    const page = new URL(pageOrigin);
-    const cleanSearch = stripKParam(local.search);
-    const target = new URL(`wss://party.${page.hostname}${local.pathname}${cleanSearch}`);
-    await validatePublicTarget(target);
-
-    auth.session.wsCount = (auth.session.wsCount || 0) + 1;
-    let released = false;
-    const release = () => {
-      if (released) return;
-      released = true;
-      auth.session.wsCount = Math.max(0, (auth.session.wsCount || 1) - 1);
-    };
-    client.once('close', release);
-
-    const hostname = String(req.headers.host || '').split(':')[0];
-    const isLocalhost = hostname.endsWith('localhost') || hostname === '127.0.0.1';
-    const secure = (req.socket.encrypted || isLocalhost) ? '; Secure' : '';
-    const sameSite = secure ? 'None' : 'Lax';
-    const extraHeaders = auth.source === 'query'
-      ? { 'Set-Cookie': `__pv_proxy=${sessionId}; HttpOnly; SameSite=${sameSite}; Path=/; Max-Age=86400${secure}` }
-      : null;
-
-    await relayUpgrade(req, client, head, target, page.origin, sessionId, extraHeaders);
-  } catch (error) {
-    console.log(`[proxy] party WS rejected: ${error.message || error} sid=${sessionId.slice(0, 8)}`);
-    client.write('HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\n\r\n');
-    client.destroy();
-  }
 });
 
 // ---------------------------------------------------------------------------
@@ -1865,22 +1754,14 @@ try {
 setInterval(pruneSessions, 60 * 1000).unref();
 setInterval(cleanupRateLimits, 60 * 1000).unref();
 
-launcher.listen(PORT, BIND_ADDRESS, () => {
+server.listen(PORT, BIND_ADDRESS, () => {
   const scheme = tlsOptions ? 'https' : 'http';
-  console.log(`Local launcher: ${scheme}://${LAUNCHER_HOST}:${PORT}/?k=<token>`);
+  console.log(`Launcher: ${scheme}://localhost:${PORT}/?k=<token>`);
   console.log(`Token file: ${TOKEN_PATH}`);
-  console.log(`Local site proxy: ${scheme}://${HOST}:${PROXY_PORT}`);
-  console.log(`Party socket relay: ${scheme}://${HOST}:${PARTY_PORT}`);
   console.log(`Bind address: ${BIND_ADDRESS}${BIND_ADDRESS === '127.0.0.1' ? ' (loopback only)' : ' (non-loopback; PROXY_TOKEN required)'}`);
-  console.log('All services listen only on this machine; no router port is exposed by the helper itself.');
+  console.log('All services are running on this single port.');
 });
-launcher.on('error', (error) => { console.error(error.message); process.exitCode = 1; });
-
-proxy.listen(PROXY_PORT, BIND_ADDRESS);
-proxy.on('error', (error) => { console.error(error.message); process.exitCode = 1; });
-
-party.listen(PARTY_PORT, BIND_ADDRESS);
-party.on('error', (error) => { console.error(`Party relay: ${error.message}`); process.exitCode = 1; });
+server.on('error', (error) => { console.error(error.message); process.exitCode = 1; });
 
 for (const signal of ['SIGINT', 'SIGTERM']) {
   process.on(signal, () => {

@@ -1,5 +1,5 @@
 {
-  "name": "website-viewer-proxy",
+  "name": "proxy",
   "version": "1.0.0",
   "main": "server.js",
   "scripts": {
