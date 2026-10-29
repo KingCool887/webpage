@@ -11,7 +11,7 @@ const { lookup } = require('node:dns/promises');
 const { Readable } = require('node:stream');
 
 const HOST = '127.0.0.1';
-const BIND_ADDRESS = process.env.BIND_ADDRESS || '0.0.0.0';
+const BIND_ADDRESS = process.env.BIND_ADDRESS || '127.0.0.1';
 const PORT = Number(process.env.PORT || 8787); // Single port for everything
 const PAGE_PATH = path.join(__dirname, 'index.html');
 const TOKEN_PATH = path.join(__dirname, '.proxy-token');
@@ -194,6 +194,11 @@ function stripKParam(search) {
 function responseChunkSize(chunk, encoding) {
   if (typeof chunk === 'string') return Buffer.byteLength(chunk, encoding);
   return chunk && typeof chunk.byteLength === 'number' ? chunk.byteLength : 0;
+}
+
+function isLocalhostHost(req) {
+  const host = String(req.headers.host || '').split(':')[0];
+  return host.endsWith('localhost') || host === '127.0.0.1';
 }
 
 // ---------------------------------------------------------------------------
@@ -954,8 +959,8 @@ function rewriteHtml(html, target) {
   const runtime = PROXY_DIAGNOSTICS_AGENT + `<script>(function(){
     const TARGET_TOKEN = ${JSON.stringify(encodeTarget(target.origin))};
     const TARGET_BASE = (function(){ const b=TARGET_TOKEN.replace(/-/g,'+').replace(/_/g,'/'); return new TextDecoder().decode(Uint8Array.from(atob(b+'='.repeat((4-b.length%4)%4)),c=>c.charCodeAt(0))); })();
-    const proxyOrigins = new Map();
     const encode = value => btoa(unescape(encodeURIComponent(value))).replace(/\\+/g,'-').replace(/\\//g,'_').replace(/=+$/g,'');
+    
     const proxify = value => {
       if (typeof value !== 'string') value = String(value);
       if (/^(data:|blob:|javascript:|mailto:|tel:|about:)/i.test(value)) return value;
@@ -963,15 +968,17 @@ function rewriteHtml(html, target) {
         let current = new URL(value, TARGET_BASE);
         if (!['http:','https:'].includes(current.protocol)) return value;
         if (!current.hostname.includes('.')) return value;
-        if (current.hostname.endsWith('.localhost') && Number(current.port) === ${PORT}) {
-          if (current.pathname.startsWith('/p/')) return current.href;
-          const actualOrigin = proxyOrigins.get(current.hostname);
-          if (!actualOrigin) return value;
-          current = new URL(current.pathname + current.search + current.hash, actualOrigin);
-        }
+
+        // If it's already a proxy URL, leave it alone to prevent double-proxying
+        if (current.pathname.startsWith('/p/')) return current.pathname + current.search;
+
+        // If it points to our proxy server, don't re-proxy it
+        if (current.host === window.location.host) return current.href;
+
         return '/p/' + encode(current.origin) + current.pathname + current.search;
       } catch { return value; }
     };
+    
     const originalFetch = window.fetch.bind(window);
     window.fetch = async function(input, init){
       const request = input instanceof Request ? input : new Request(input, init);
@@ -993,6 +1000,7 @@ function rewriteHtml(html, target) {
       }
       return originalFetch(proxified, options);
     };
+    
     const originalOpen = XMLHttpRequest.prototype.open;
     XMLHttpRequest.prototype.open = function(method, url, ...rest){ return originalOpen.call(this, method, proxify(String(url)), ...rest); };
     const originalBeacon = navigator.sendBeacon && navigator.sendBeacon.bind(navigator);
@@ -1287,8 +1295,7 @@ const server = createServer({ timeout: 0 }, async (req, res) => {
     if (auth.source === 'query' && req.method === 'GET') {
       const cleanUrl = new URL(req.url, `http://${HOST}:${PORT}`);
       cleanUrl.searchParams.delete('__k');
-      const isLocalhost = String(req.headers.host || '').includes('localhost') || String(req.headers.host || '').includes('127.0.0.1');
-      const secure = (req.socket.encrypted || isLocalhost) ? '; Secure' : '';
+      const secure = isLocalhostHost(req) ? (req.socket.encrypted ? '; Secure' : '') : '; Secure';
       const sameSite = secure ? 'None' : 'Lax';
       res.writeHead(302, {
         'Location': cleanUrl.pathname + cleanUrl.search,
@@ -1710,9 +1717,7 @@ server.on('upgrade', async (req, client, head) => {
   client.once('close', release);
   const startTime = Date.now();
 
-  const hostname = String(req.headers.host || '').split(':')[0];
-  const isLocalhost = hostname.endsWith('localhost') || hostname === '127.0.0.1';
-  const secure = (req.socket.encrypted || isLocalhost) ? '; Secure' : '';
+  const secure = isLocalhostHost(req) ? (req.socket.encrypted ? '; Secure' : '') : '; Secure';
   const sameSite = secure ? 'None' : 'Lax';
   const extraHeaders = auth.source === 'query'
     ? { 'Set-Cookie': `__pv_proxy=${sessionId}; HttpOnly; SameSite=${sameSite}; Path=/; Max-Age=86400${secure}` }
