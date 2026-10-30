@@ -129,6 +129,12 @@ function rewriteHtml(html, target) {
 
   // runtime: NO WebSocket monkey-patch. Everything else patched.
   const runtime = `<script>(function(){
+    window.addEventListener('error', function(e){
+      console.error('[proxy-err]', e.message, '@', e.filename + ':' + e.lineno + ':' + e.colno, e.error);
+    });
+    window.addEventListener('unhandledrejection', function(e){
+      console.error('[proxy-rej]', e.reason);
+    });
     var TARGET_BASE = ${JSON.stringify(target.origin)};
     var TARGET_HOSTNAME = new URL(TARGET_BASE).hostname;
     var NATIVE_FETCH = window.fetch.bind(window);
