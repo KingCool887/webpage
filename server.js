@@ -231,6 +231,18 @@ function rewriteHtml(html, target) {
     patch(HTMLVideoElement.prototype, 'poster');
     patch(HTMLFormElement.prototype, 'action');
 
+    // Global setAttribute — catches new Image().setAttribute('src', ...),
+    // which bypasses the document.createElement patch because new Image()
+    // doesn't route through createElement internally.
+    var urlAttrs = { src: 1, href: 1, action: 1, formaction: 1, poster: 1 };
+    var nativeSetAttr = Element.prototype.setAttribute;
+    Element.prototype.setAttribute = function(name, value) {
+      if (urlAttrs[String(name).toLowerCase()] && typeof value === 'string') {
+        value = proxify(value);
+      }
+      return nativeSetAttr.call(this, name, value);
+    };
+
     // Service worker register
     if (navigator.serviceWorker) {
       var nativeReg = navigator.serviceWorker.register;
@@ -238,9 +250,9 @@ function rewriteHtml(html, target) {
         return nativeReg.call(this, proxify(String(scriptURL)), opts);
       };
     }
-    
+
     var imgDesc = Object.getOwnPropertyDescriptor(HTMLImageElement.prototype, 'src');
-console.log('[proxy] img.src descriptor:', imgDesc ? { hasGet: !!imgDesc.get, hasSet: !!imgDesc.set, configurable: imgDesc.configurable } : 'missing');
+    console.log('[proxy] img.src descriptor:', imgDesc ? { hasGet: !!imgDesc.get, hasSet: !!imgDesc.set, configurable: imgDesc.configurable } : 'missing');
     console.log('[proxy] runtime installed target=' + TARGET_BASE);
   })();</script>`;
 
@@ -250,15 +262,13 @@ console.log('[proxy] img.src descriptor:', imgDesc ? { hasGet: !!imgDesc.get, ha
 }
 
 // ---------- cookies ----------
+// Note: cookies are scoped to Path=/ (not /p/<token>/) so they are also sent
+// on /_ws/ WebSocket upgrades. Without this, session cookies set on the page
+// are missing on the party socket and the server rejects the handshake.
 function rewriteSetCookie(cookie, target) {
-  const prefix = `/p/${encodeTarget(target.origin)}`;
   let out = cookie.replace(/;\s*domain=[^;]*/i, '');
-  out = out.replace(/;\s*path=([^;]*)/i, (m, p) => {
-    const raw = (p.trim() || '/');
-    const norm = raw.startsWith('/') ? raw : `/${raw}`;
-    return `; Path=${prefix}${norm === '/' ? '' : norm}`;
-  });
-  if (!/;\s*path=/i.test(out)) out += `; Path=${prefix}`;
+  out = out.replace(/;\s*path=[^;]*/i, '; Path=/');
+  if (!/;\s*path=/i.test(out)) out += '; Path=/';
   if (/;\s*SameSite=(Lax|Strict)/i.test(out)) out = out.replace(/;\s*SameSite=(Lax|Strict)/i, '; SameSite=None');
   else if (!/;\s*SameSite=/i.test(out)) out += '; SameSite=None';
   if (!/;\s*Secure/i.test(out)) out += '; Secure';
@@ -400,6 +410,8 @@ async function relayUpgrade(req, client, head, target, originOverride, sid) {
     if (!hasOrigin && originOverride) lines.push(`Origin: ${originOverride}`);
     upstream.write(`${lines.join('\r\n')}\r\n\r\n`);
     if (head?.length) upstream.write(head);
+    console.log(`[ws] dialing ${target.href} sid=${sid.slice(0, 8)}`);
+    console.log(`[ws] outgoing: ${lines[0]} | Host: ${target.host} | Origin: ${originOverride || '(none)'}`);
     client.pipe(upstream);
   });
 
@@ -409,12 +421,15 @@ async function relayUpgrade(req, client, head, target, originOverride, sid) {
     const end = buf.indexOf('\r\n\r\n');
     if (end < 0) return;
     const handshake = buf.subarray(0, end + 4).toString('latin1');
+    const statusLine = handshake.split('\r\n')[0];
     if (!/^HTTP\/1\.[01] 101\b/m.test(handshake)) {
+      console.log(`[ws] upstream rejected: ${statusLine} sid=${sid.slice(0, 8)}`);
       client.write(buf);
       client.end();
       upstream.destroy();
       return;
     }
+    console.log(`[ws] upstream accepted: ${statusLine} sid=${sid.slice(0, 8)}`);
     client.write(buf);
     upstream.removeListener('data', onData);
 
@@ -440,7 +455,10 @@ async function relayUpgrade(req, client, head, target, originOverride, sid) {
     upstream.pipe(client);
   };
   upstream.on('data', onData);
-  upstream.on('error', () => client.destroy());
+  upstream.on('error', (e) => {
+    console.log(`[ws] upstream error: ${e.message} sid=${sid.slice(0, 8)}`);
+    client.destroy();
+  });
   client.on('error', () => upstream.destroy());
 }
 
@@ -518,7 +536,7 @@ server.on('upgrade', async (req, client, head) => {
       const o = local.searchParams.get('o');
       if (o) try { originOverride = Buffer.from(o, 'base64url').toString('utf8'); } catch {}
       await validatePublicTarget(target);
-      console.log(`[ws] fallback -> ${target.href} origin=${originOverride} sid=${sid.slice(0, 8)}`);
+      console.log(`[ws] explicit -> ${target.href} origin=${originOverride || '(none)'} sid=${sid.slice(0, 8)}`);
     } else {
       // Relative /ws upgrade. Find the target via Referer.
       let pageTarget = null;
@@ -546,6 +564,7 @@ server.on('upgrade', async (req, client, head) => {
       target = new URL(`wss://${wsHost}${local.pathname}${search}`);
       originOverride = pageTarget.origin;
       await validatePublicTarget(target);
+      console.log(`[ws] fallback -> ${target.href} origin=${originOverride} sid=${sid.slice(0, 8)}`);
     }
   } catch (e) {
     console.log(`[ws] rejected: ${e.message} sid=${sid.slice(0, 8)}`);
