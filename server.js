@@ -347,10 +347,11 @@ async function proxyRequest(req, res, target) {
     const text = await upstream.text();
     // Rewrite any wss:// URL embedded in JSON (party server style) to /_ws/<token>?o=<origin>
     const originToken = Buffer.from(target.origin, 'utf8').toString('base64url');
+    const wsScheme = (req.headers['x-forwarded-proto'] === 'https' || req.socket.encrypted) ? 'wss' : 'ws';
     const rewritten = text.replace(/(["'])wss?:\/\/[^"']+\1/gi, (match, q) => {
       const url = match.slice(1, -1);
       const encoded = Buffer.from(url.replace(/^wss:\/\//i, 'https://').replace(/^ws:\/\//i, 'http://')).toString('base64url');
-      return `${q}ws://${req.headers.host}/_ws/${encoded}?o=${originToken}${q}`;
+      return `${q}${wsScheme}://${req.headers.host}/_ws/${encoded}?o=${originToken}${q}`;
     });
     headerObj['content-type'] = 'application/json; charset=utf-8';
     res.writeHead(upstream.status, headerObj);
@@ -511,7 +512,6 @@ server.on('upgrade', async (req, client, head) => {
     if (explicit) {
       target = decodeTarget(explicit[1]);
       if (explicit[2]) target.pathname = explicit[2];
-      if (local.search) target.search = local.search;
       target.protocol = target.protocol === 'https:' ? 'wss:' : 'ws:';
       const o = local.searchParams.get('o');
       if (o) try { originOverride = Buffer.from(o, 'base64url').toString('utf8'); } catch {}
