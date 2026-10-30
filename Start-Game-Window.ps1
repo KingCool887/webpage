@@ -7,8 +7,12 @@ if (-not $node) {
 
 Set-Location -LiteralPath $project
 Write-Host 'Keep this PowerShell window open while using the launcher.'
-Write-Host 'Open the launcher URL printed by the server (it includes your launcher token).'
-Write-Host 'If no URL was printed, read the token from .proxy-token and open:'
-Write-Host '  http://launcher.localhost:8787/?k=<token>'
-Write-Host 'Proxy request logs appear below. They include site paths but omit query strings and cookies.'
+Write-Host ''
+Write-Host 'Open the launcher in your browser with one of your keys, for example:'
+Write-Host '  http://localhost:8787/?key=Colin_4587'
+Write-Host ''
+Write-Host '(The first visit sets a session cookie; after that the plain URL works.)'
+Write-Host ''
+Write-Host 'Proxy logs appear below. They show method, status, elapsed, and content-type only —'
+Write-Host 'the target host and path are not printed.'
 & $node.Source (Join-Path $project 'server.js')

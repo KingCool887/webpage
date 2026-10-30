@@ -26,13 +26,13 @@
     <button id="launch-btn" class="tool" type="button">Launch</button>
   </header>
   <main id="stage">
-    <iframe id="viewer" title="Website view" allow="autoplay; fullscreen; gamepad; clipboard-read; clipboard-write; identity-credentials-get" referrerpolicy="no-referrer"></iframe>
+    <iframe id="viewer" title="Website view"
+      allow="autoplay; fullscreen; pointer-lock; gamepad; clipboard-read; clipboard-write; identity-credentials-get"
+      referrerpolicy="no-referrer"></iframe>
   </main>
   <script>
-    window.__PV_SESSION__ = __PV_SESSION_JSON__;
     const address = document.querySelector('#address');
     const viewer = document.querySelector('#viewer');
-    const proxyPort = __PROXY_PORT__;
 
     function toBase64Url(value) {
       const bytes = new TextEncoder().encode(value);
@@ -42,23 +42,20 @@
     }
 
     function proxyUrl(target) {
-      const session = window.__PV_SESSION__ || '';
-      const sep = target.search ? '&' : '?';
-      return `/p/${toBase64Url(target.href)}${target.pathname}${target.search}${sep}__k=${encodeURIComponent(session)}`;
+      return `/p/${toBase64Url(target.href)}${target.pathname}${target.search}`;
     }
 
     document.querySelector('#launch-btn').addEventListener('click', () => {
       let val = address.value.trim();
+      if (!val) return;
       if (!val.startsWith('http')) val = 'https://' + val;
       try {
         const target = new URL(val);
         viewer.src = proxyUrl(target);
-      } catch (e) {
-        alert("Invalid URL");
-      }
+      } catch { alert('Invalid URL'); }
     });
 
-    // Auto-launch on load for testing
+    // Auto-launch on load so returning users land straight in the game.
     document.querySelector('#launch-btn').click();
   </script>
 </body>
