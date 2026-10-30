@@ -16,8 +16,8 @@ const COOKIE_NAME = '__proxy_access';
 const MAX_REQUEST_BYTES = 32 * 1024 * 1024;
 const MAX_WS_PER_SESSION = 20;
 
-const lastMatchIpByTarget = new Map();
-const proxyHostTargets = new Map();
+const lastMatchIpByTarget = new Map();   // `${sessionId}:${targetOrigin}` -> 32-hex
+const proxyHostTargets = new Map();       // sanitized req.host -> target origin (for legacy /ws)
 const wsCountByKey = new Map();
 
 // ---------- users ----------
@@ -35,12 +35,10 @@ function keyFromCookie(header) {
   const m = (header || '').match(new RegExp(`(?:^|;\\s*)${COOKIE_NAME}=([^;]+)`));
   return m ? decodeURIComponent(m[1]) : null;
 }
-
 function isAuthed(req) {
   const k = keyFromCookie(req.headers.cookie);
   return !!(k && VALID_KEYS.has(k));
 }
-
 function sessionId(req) {
   return keyFromCookie(req.headers.cookie) || 'anon';
 }
@@ -51,8 +49,7 @@ function checkAuth(req, res) {
   if (q) {
     if (!VALID_KEYS.has(q)) {
       res.writeHead(401, { 'Content-Type': 'text/plain' });
-      res.end('Unknown key.');
-      return false;
+      return res.end('Unknown key.'), false;
     }
     url.searchParams.delete('key');
     const secure = req.headers['x-forwarded-proto'] === 'https' ? '; Secure' : '';
@@ -61,32 +58,24 @@ function checkAuth(req, res) {
       'Set-Cookie': `${COOKIE_NAME}=${encodeURIComponent(q)}; HttpOnly; SameSite=Lax; Path=/; Max-Age=604800${secure}`,
       'Cache-Control': 'no-store',
     });
-    res.end();
-    return false;
+    return res.end(), false;
   }
   if (!isAuthed(req)) {
     res.writeHead(401, { 'Content-Type': 'text/plain' });
-    res.end('Add ?key=<yours> once.');
-    return false;
+    return res.end('Add ?key=<yours> once.'), false;
   }
   return true;
 }
 
 // ---------- targets ----------
-function encodeTarget(v) {
-  return Buffer.from(v, 'utf8').toString('base64url');
-}
-
+function encodeTarget(v) { return Buffer.from(v, 'utf8').toString('base64url'); }
 function decodeTarget(v) {
   if (!/^[A-Za-z0-9_-]{1,12000}$/.test(v)) throw new Error('Invalid address.');
   const t = new URL(Buffer.from(v, 'base64url').toString('utf8'));
   if (!['http:', 'https:'].includes(t.protocol)) throw new Error('Only HTTP(S).');
   return t;
 }
-
-function proxyPath(t) {
-  return `/p/${encodeTarget(t.origin)}${t.pathname}${t.search}`;
-}
+function proxyPath(t) { return `/p/${encodeTarget(t.origin)}${t.pathname}${t.search}`; }
 
 function isPrivateAddress(a) {
   const f = net.isIP(a);
@@ -98,14 +87,10 @@ function isPrivateAddress(a) {
   if (f === 6) return a === '::' || a === '::1' || a.startsWith('fc') || a.startsWith('fd') || a.startsWith('fe8');
   return true;
 }
-
 async function validatePublicTarget(t) {
   const h = t.hostname.toLowerCase();
   if (h === 'localhost' || h.endsWith('.localhost') || h.endsWith('.local')) throw new Error('Local addr.');
-  if (net.isIP(h)) {
-    if (isPrivateAddress(h)) throw new Error('Private addr.');
-    return;
-  }
+  if (net.isIP(h)) { if (isPrivateAddress(h)) throw new Error('Private addr.'); return; }
   const ans = await lookup(h, { all: true, verbatim: true });
   if (!ans.length || ans.some(a => isPrivateAddress(a.address))) throw new Error('Did not resolve public.');
 }
@@ -118,11 +103,8 @@ function resolveLink(v, base) {
     const r = new URL(raw, base);
     if (!['http:', 'https:'].includes(r.protocol)) return v;
     return proxyPath(r);
-  } catch {
-    return v;
-  }
+  } catch { return v; }
 }
-
 function rewriteCss(css, base) {
   return css
     .replace(/url\(\s*(['"]?)(.*?)\1\s*\)/gi, (m, q, v) => `url("${resolveLink(v, base)}")`)
@@ -152,11 +134,9 @@ function rewriteHtml(html, target) {
     var NATIVE_FETCH = window.fetch.bind(window);
     var NATIVE_BEACON = navigator.sendBeacon ? navigator.sendBeacon.bind(navigator) : null;
 
-    function encode(v) {
-      return btoa(unescape(encodeURIComponent(v))).replace(/\\+/g, '-').replace(/\\//g, '_').replace(/=+$/g, '');
-    }
+    function encode(v){ return btoa(unescape(encodeURIComponent(v))).replace(/\\+/g,'-').replace(/\\//g,'_').replace(/=+$/g,''); }
 
-    function proxify(value) {
+    function proxify(value){
       if (typeof value !== 'string') value = String(value);
       if (/^(data:|blob:|javascript:|mailto:|tel:|about:)/i.test(value)) return value;
       try {
@@ -166,24 +146,19 @@ function rewriteHtml(html, target) {
         if (current.pathname.indexOf('/p/') === 0) return current.pathname + current.search;
         if (current.pathname.indexOf('/_ws/') === 0) return current.pathname + current.search;
         return '/p/' + encode(current.origin) + current.pathname + current.search;
-      } catch (e) {
-        return value;
-      }
+      } catch (e) { return value; }
     }
 
     // fetch
-    window.fetch = async function(input, init) {
+    window.fetch = async function(input, init){
       var request = input instanceof Request ? input : new Request(input, init);
       var proxified = proxify(request.url);
       var opts = {
-        method: request.method,
-        headers: request.headers,
+        method: request.method, headers: request.headers,
         mode: request.mode === 'navigate' ? 'cors' : request.mode,
         credentials: 'include',
-        cache: request.cache,
-        redirect: request.redirect,
-        integrity: request.integrity,
-        signal: request.signal
+        cache: request.cache, redirect: request.redirect,
+        integrity: request.integrity, signal: request.signal
       };
       if (request.body && request.method !== 'GET' && request.method !== 'HEAD') {
         opts.body = await request.clone().arrayBuffer();
@@ -193,7 +168,7 @@ function rewriteHtml(html, target) {
 
     // XHR
     var nativeOpen = XMLHttpRequest.prototype.open;
-    XMLHttpRequest.prototype.open = function(method, url) {
+    XMLHttpRequest.prototype.open = function(method, url){
       var args = Array.prototype.slice.call(arguments);
       args[1] = proxify(String(url));
       return nativeOpen.apply(this, args);
@@ -201,21 +176,16 @@ function rewriteHtml(html, target) {
 
     // sendBeacon
     if (NATIVE_BEACON) {
-      navigator.sendBeacon = function(url, data) {
-        try {
-          return NATIVE_BEACON(proxify(String(url)), data);
-        } catch (e) {
-          return NATIVE_BEACON(url, data);
-        }
+      navigator.sendBeacon = function(url, data){
+        try { return NATIVE_BEACON(proxify(String(url)), data); }
+        catch (e) { return NATIVE_BEACON(url, data); }
       };
     }
 
     // EventSource
     if (window.EventSource) {
       var ES = window.EventSource;
-      window.EventSource = function(url, opts) {
-        return new ES(proxify(String(url)), opts);
-      };
+      window.EventSource = function(url, opts){ return new ES(proxify(String(url)), opts); };
       window.EventSource.prototype = ES.prototype;
       window.EventSource.CONNECTING = ES.CONNECTING;
       window.EventSource.OPEN = ES.OPEN;
@@ -224,17 +194,15 @@ function rewriteHtml(html, target) {
 
     // window.open
     var nativeOpen2 = window.open.bind(window);
-    window.open = function(url) {
-      return nativeOpen2(proxify(String(url)));
-    };
+    window.open = function(url){ return nativeOpen2(proxify(String(url))); };
 
     // createElement + setAttribute
     var nativeCreate = document.createElement.bind(document);
-    document.createElement = function(tag) {
+    document.createElement = function(tag){
       var el = nativeCreate(tag);
       if (tag && (tag.toLowerCase() === 'script' || tag.toLowerCase() === 'link' || tag.toLowerCase() === 'img')) {
         var nativeSet = el.setAttribute;
-        el.setAttribute = function(name, value) {
+        el.setAttribute = function(name, value){
           var l = String(name).toLowerCase();
           if (l === 'src' || l === 'href') value = proxify(String(value));
           return nativeSet.call(el, name, value);
@@ -244,14 +212,13 @@ function rewriteHtml(html, target) {
     };
 
     // URL property patches
-    function patch(proto, prop) {
+    function patch(proto, prop){
       var d = Object.getOwnPropertyDescriptor(proto, prop);
       if (!d || !d.get || !d.set || !d.configurable) return;
       Object.defineProperty(proto, prop, {
-        configurable: true,
-        enumerable: d.enumerable,
-        get: function() { return d.get.call(this); },
-        set: function(v) { d.set.call(this, typeof v === 'string' ? proxify(v) : v); }
+        configurable: true, enumerable: d.enumerable,
+        get: function(){ return d.get.call(this); },
+        set: function(v){ d.set.call(this, typeof v === 'string' ? proxify(v) : v); }
       });
     }
     patch(HTMLIFrameElement.prototype, 'src');
@@ -267,69 +234,9 @@ function rewriteHtml(html, target) {
     // Service worker register
     if (navigator.serviceWorker) {
       var nativeReg = navigator.serviceWorker.register;
-      navigator.serviceWorker.register = function(scriptURL, opts) {
+      navigator.serviceWorker.register = function(scriptURL, opts){
         return nativeReg.call(this, proxify(String(scriptURL)), opts);
       };
-    }
-
-    // Global setAttribute — catches new Image(), new Audio(), dynamically built tags,
-    // anything that isn't going through document.createElement.
-    var urlAttributes = { src: 1, href: 1, action: 1, formaction: 1, poster: 1, data: 1 };
-    var nativeSetAttributeGlobal = Element.prototype.setAttribute;
-    Element.prototype.setAttribute = function(name, value) {
-      var l = String(name).toLowerCase();
-      if (urlAttributes[l] === 1 && typeof value === 'string') {
-        value = proxify(value);
-      }
-      return nativeSetAttributeGlobal.call(this, name, value);
-    };
-
-    // Belt-and-braces: if something still slipped through, rewrite src/href on
-    // insertion via a MutationObserver. Cheap because it only inspects a subset.
-    if (window.MutationObserver) {
-      var checkElement = function(el) {
-        if (!el || el.nodeType !== 1) return;
-        var tag = el.tagName ? el.tagName.toLowerCase() : '';
-        if (tag === 'img' || tag === 'script' || tag === 'link' || tag === 'source' ||
-            tag === 'video' || tag === 'audio' || tag === 'iframe') {
-          var src = el.getAttribute && el.getAttribute('src');
-          var href = el.getAttribute && el.getAttribute('href');
-          if (src && src.charAt(0) !== '/' && !/^(data|blob|javascript):/i.test(src)) {
-            try { el.setAttribute('src', proxify(src)); } catch (e) {}
-          } else if (src && src.charAt(0) === '/' && src.indexOf('/p/') !== 0 &&
-                     src.indexOf('/_ws/') !== 0 && src.indexOf('//') !== 0) {
-            try { el.setAttribute('src', proxify(src)); } catch (e) {}
-          }
-          if (href && href.charAt(0) === '/' && href.indexOf('/p/') !== 0 && href.indexOf('/_ws/') !== 0) {
-            try { el.setAttribute('href', proxify(href)); } catch (e) {}
-          }
-        }
-      };
-      var observer = new MutationObserver(function(muts) {
-        for (var i = 0; i < muts.length; i++) {
-          var m = muts[i];
-          if (m.type === 'attributes' && m.target) {
-            checkElement(m.target);
-            continue;
-          }
-          if (m.addedNodes) {
-            for (var j = 0; j < m.addedNodes.length; j++) {
-              var node = m.addedNodes[j];
-              checkElement(node);
-              if (node && node.querySelectorAll) {
-                var kids = node.querySelectorAll('img,script,link,source,video,audio,iframe');
-                for (var k = 0; k < kids.length; k++) checkElement(kids[k]);
-              }
-            }
-          }
-        }
-      });
-      observer.observe(document.documentElement, {
-        childList: true,
-        subtree: true,
-        attributes: true,
-        attributeFilter: ['src', 'href']
-      });
     }
 
     console.log('[proxy] runtime installed target=' + TARGET_BASE);
@@ -358,8 +265,7 @@ function rewriteSetCookie(cookie, target) {
 
 // ---------- request forwarding ----------
 async function readRequestBody(req) {
-  const chunks = [];
-  let size = 0;
+  const chunks = []; let size = 0;
   for await (const c of req) {
     size += c.length;
     if (size > MAX_REQUEST_BYTES) throw new Error('Too large');
@@ -380,11 +286,8 @@ async function proxyRequest(req, res, target) {
     if (Array.isArray(value)) headers.set(name, value.join(', '));
     else headers.set(name, value);
   }
-  const cookie = (req.headers.cookie || '')
-    .split(';')
-    .map(c => c.trim())
-    .filter(c => c && !c.startsWith(COOKIE_NAME + '='))
-    .join('; ');
+  const cookie = (req.headers.cookie || '').split(';').map(c => c.trim())
+    .filter(c => c && !c.startsWith(COOKIE_NAME + '=')).join('; ');
   if (cookie) headers.set('cookie', cookie);
   if (req.headers.origin) headers.set('origin', target.origin);
   if (req.headers.referer) {
@@ -399,15 +302,12 @@ async function proxyRequest(req, res, target) {
   const upstream = await fetch(target, { method: req.method, headers, body, redirect: 'manual' });
 
   const out = new Headers(upstream.headers);
-  for (const n of [
-    'content-security-policy', 'content-security-policy-report-only', 'x-frame-options',
-    'cross-origin-opener-policy', 'cross-origin-embedder-policy', 'cross-origin-resource-policy',
-    'permissions-policy', 'access-control-allow-origin', 'access-control-allow-credentials',
-    'content-encoding', 'content-length', 'transfer-encoding', 'connection', 'set-cookie', 'alt-svc'
-  ]) {
+  for (const n of ['content-security-policy','content-security-policy-report-only','x-frame-options',
+                   'cross-origin-opener-policy','cross-origin-embedder-policy','cross-origin-resource-policy',
+                   'permissions-policy','access-control-allow-origin','access-control-allow-credentials',
+                   'content-encoding','content-length','transfer-encoding','connection','set-cookie','alt-svc']) {
     out.delete(n);
   }
-
   const ct = upstream.headers.get('content-type') || '';
   if (/text\/html|application\/xhtml\+xml/i.test(ct)) out.set('cache-control', 'no-store');
 
@@ -425,11 +325,7 @@ async function proxyRequest(req, res, target) {
   const setCookie = cookies.map(c => rewriteSetCookie(c, target));
 
   const location = upstream.headers.get('location');
-  if (location) {
-    try {
-      out.set('location', proxyPath(new URL(location, target)));
-    } catch {}
-  }
+  if (location) { try { out.set('location', proxyPath(new URL(location, target))); } catch {} }
 
   const headerObj = {};
   for (const [k, v] of out.entries()) headerObj[k] = v;
@@ -441,24 +337,20 @@ async function proxyRequest(req, res, target) {
     res.writeHead(upstream.status, headerObj);
     return res.end(html);
   }
-
   if (/text\/css/i.test(ct)) {
     const css = rewriteCss(await upstream.text(), target);
     headerObj['content-type'] = 'text/css; charset=utf-8';
     res.writeHead(upstream.status, headerObj);
     return res.end(css);
   }
-
   if (/application\/json|text\/plain/i.test(ct)) {
     const text = await upstream.text();
+    // Rewrite any wss:// URL embedded in JSON (party server style) to /_ws/<token>?o=<origin>
     const originToken = Buffer.from(target.origin, 'utf8').toString('base64url');
-    const wsScheme = (req.headers['x-forwarded-proto'] === 'https' || req.socket.encrypted) ? 'wss' : 'ws';
     const rewritten = text.replace(/(["'])wss?:\/\/[^"']+\1/gi, (match, q) => {
       const url = match.slice(1, -1);
-      const encoded = Buffer.from(
-        url.replace(/^wss:\/\//i, 'https://').replace(/^ws:\/\//i, 'http://')
-      ).toString('base64url');
-      return `${q}${wsScheme}://${req.headers.host}/_ws/${encoded}?o=${originToken}${q}`;
+      const encoded = Buffer.from(url.replace(/^wss:\/\//i, 'https://').replace(/^ws:\/\//i, 'http://')).toString('base64url');
+      return `${q}ws://${req.headers.host}/_ws/${encoded}?o=${originToken}${q}`;
     });
     headerObj['content-type'] = 'application/json; charset=utf-8';
     res.writeHead(upstream.status, headerObj);
@@ -468,12 +360,8 @@ async function proxyRequest(req, res, target) {
   res.writeHead(upstream.status, headerObj);
   if (!upstream.body || req.method === 'HEAD') return res.end();
   const ds = Readable.fromWeb(upstream.body);
-  ds.on('error', () => {
-    if (!res.destroyed) res.destroy();
-  });
-  res.on('close', () => {
-    if (!res.writableFinished) ds.destroy();
-  });
+  ds.on('error', () => { if (!res.destroyed) res.destroy(); });
+  res.on('close', () => { if (!res.writableFinished) ds.destroy(); });
   ds.pipe(res);
 }
 
@@ -496,21 +384,10 @@ async function relayUpgrade(req, client, head, target, originOverride, sid) {
     let hasOrigin = false;
     for (const [name, value] of Object.entries(req.headers)) {
       const lower = name.toLowerCase();
-      if (lower === 'host') {
-        lines.push(`Host: ${target.host}`);
-        continue;
-      }
-      if (lower === 'origin') {
-        hasOrigin = true;
-        lines.push(`Origin: ${originOverride || target.origin.replace(/^wss?:/i, 'https:')}`);
-        continue;
-      }
+      if (lower === 'host') { lines.push(`Host: ${target.host}`); continue; }
+      if (lower === 'origin') { hasOrigin = true; lines.push(`Origin: ${originOverride || target.origin.replace(/^wss?:/i, 'https:')}`); continue; }
       if (lower === 'cookie') {
-        const c = String(value)
-          .split(';')
-          .map(x => x.trim())
-          .filter(x => x && !x.startsWith(COOKIE_NAME + '='))
-          .join('; ');
+        const c = String(value).split(';').map(x => x.trim()).filter(x => x && !x.startsWith(COOKIE_NAME + '=')).join('; ');
         if (c) lines.push(`Cookie: ${c}`);
         continue;
       }
@@ -519,7 +396,7 @@ async function relayUpgrade(req, client, head, target, originOverride, sid) {
     }
     if (!hasOrigin && originOverride) lines.push(`Origin: ${originOverride}`);
     upstream.write(`${lines.join('\r\n')}\r\n\r\n`);
-    if (head && head.length) upstream.write(head);
+    if (head?.length) upstream.write(head);
     client.pipe(upstream);
   });
 
@@ -559,7 +436,6 @@ async function relayUpgrade(req, client, head, target, originOverride, sid) {
 
     upstream.pipe(client);
   };
-
   upstream.on('data', onData);
   upstream.on('error', () => client.destroy());
   client.on('error', () => upstream.destroy());
@@ -580,15 +456,10 @@ const server = http.createServer({ timeout: 0 }, async (req, res) => {
     });
     return res.end();
   }
-
   if (!checkAuth(req, res)) return;
 
   let local;
-  try {
-    local = new URL(req.url, `http://${HOST}:${PORT}`);
-  } catch {
-    return res.writeHead(400).end();
-  }
+  try { local = new URL(req.url, `http://${HOST}:${PORT}`); } catch { return res.writeHead(400).end(); }
 
   if (local.pathname === '/favicon.ico') return res.writeHead(204).end();
 
@@ -598,17 +469,10 @@ const server = http.createServer({ timeout: 0 }, async (req, res) => {
       const m = local.pathname.match(/^\/p\/([A-Za-z0-9_-]+)(\/.*)?$/);
       if (!m) throw new Error('bad path');
       target = decodeTarget(m[1]);
-      if (m[2] && m[2] !== '/') {
-        target.pathname = m[2];
-        target.search = local.search;
-      } else if (local.search) {
-        target.search = local.search;
-      } else if (m[2] === '/') {
-        target.pathname = '/';
-      }
-    } catch (e) {
-      return res.writeHead(400).end(e.message);
-    }
+      if (m[2] && m[2] !== '/') { target.pathname = m[2]; target.search = local.search; }
+      else if (local.search) target.search = local.search;
+      else if (m[2] === '/') target.pathname = '/';
+    } catch (e) { return res.writeHead(400).end(e.message); }
     return proxyRequest(req, res, target).catch((e) => {
       if (!res.headersSent) res.writeHead(502, { 'Content-Type': 'text/plain' });
       res.end('Upstream failed: ' + e.message);
@@ -620,9 +484,7 @@ const server = http.createServer({ timeout: 0 }, async (req, res) => {
       const page = fs.readFileSync(PAGE_PATH, 'utf8');
       res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' });
       return res.end(page);
-    } catch {
-      return res.writeHead(500).end('index.html missing');
-    }
+    } catch { return res.writeHead(500).end('index.html missing'); }
   }
 
   res.writeHead(404).end('Not found');
@@ -633,7 +495,6 @@ server.on('upgrade', async (req, client, head) => {
     client.write('HTTP/1.1 401 Unauthorized\r\nConnection: close\r\n\r\n');
     return client.destroy();
   }
-
   const sid = sessionId(req);
   const key = `proxy:${sid}`;
   if ((wsCountByKey.get(key) || 0) >= MAX_WS_PER_SESSION) {
@@ -642,11 +503,7 @@ server.on('upgrade', async (req, client, head) => {
   }
 
   let local;
-  try {
-    local = new URL(req.url, `http://${HOST}:${PORT}`);
-  } catch {
-    return client.destroy();
-  }
+  try { local = new URL(req.url, `http://${HOST}:${PORT}`); } catch { return client.destroy(); }
 
   let target, originOverride;
   try {
@@ -654,18 +511,13 @@ server.on('upgrade', async (req, client, head) => {
     if (explicit) {
       target = decodeTarget(explicit[1]);
       if (explicit[2]) target.pathname = explicit[2];
+      if (local.search) target.search = local.search;
       target.protocol = target.protocol === 'https:' ? 'wss:' : 'ws:';
-      // NOTE: do NOT copy local.search onto target.search. The ?o= param is
-      // for our origin hint only; forwarding it breaks the party server.
       const o = local.searchParams.get('o');
-      if (o) {
-        try {
-          originOverride = Buffer.from(o, 'base64url').toString('utf8');
-        } catch {}
-      }
+      if (o) try { originOverride = Buffer.from(o, 'base64url').toString('utf8'); } catch {}
       await validatePublicTarget(target);
-      console.log(`[ws] -> ${target.href} origin=${originOverride || '(none)'} sid=${sid.slice(0, 8)}`);
     } else {
+      // Relative /ws upgrade. Find the target via Referer.
       let pageTarget = null;
       const ref = req.headers.referer;
       if (ref) {
@@ -687,11 +539,10 @@ server.on('upgrade', async (req, client, head) => {
       const wsHost = matchIp
         ? `ip_${matchIp}.party.${pageTarget.hostname}`
         : `party.${pageTarget.hostname}`;
-      const qs = local.search && !local.searchParams.has('__k') ? local.search : '';
-      target = new URL(`wss://${wsHost}${local.pathname}${qs}`);
+      const search = local.search && !local.searchParams.has('__k') ? local.search : '';
+      target = new URL(`wss://${wsHost}${local.pathname}${search}`);
       originOverride = pageTarget.origin;
       await validatePublicTarget(target);
-      console.log(`[ws] fallback -> ${target.href} origin=${originOverride} sid=${sid.slice(0, 8)}`);
     }
   } catch (e) {
     console.log(`[ws] rejected: ${e.message} sid=${sid.slice(0, 8)}`);
@@ -701,12 +552,7 @@ server.on('upgrade', async (req, client, head) => {
 
   wsCountByKey.set(key, (wsCountByKey.get(key) || 0) + 1);
   let released = false;
-  const release = () => {
-    if (!released) {
-      released = true;
-      decrementWs(key);
-    }
-  };
+  const release = () => { if (!released) { released = true; decrementWs(key); } };
   client.once('close', release);
 
   await relayUpgrade(req, client, head, target, originOverride, sid);
