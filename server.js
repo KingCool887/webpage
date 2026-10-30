@@ -231,13 +231,65 @@ function rewriteHtml(html, target) {
     patch(HTMLVideoElement.prototype, 'poster');
     patch(HTMLFormElement.prototype, 'action');
 
-    // Service worker register
-    if (navigator.serviceWorker) {
-      var nativeReg = navigator.serviceWorker.register;
-      navigator.serviceWorker.register = function(scriptURL, opts){
-        return nativeReg.call(this, proxify(String(scriptURL)), opts);
-      };
+// Service worker register
+if (navigator.serviceWorker) {
+  var nativeReg = navigator.serviceWorker.register;
+  navigator.serviceWorker.register = function(scriptURL, opts){
+    return nativeReg.call(this, proxify(String(scriptURL)), opts);
+  };
+}
+
+// Global setAttribute — catches new Image(), new Audio(), dynamically built tags,
+// anything that isn't going through document.createElement.
+var urlAttributes = { src: 1, href: 1, action: 1, formaction: 1, poster: 1, data: 1 };
+var nativeSetAttributeGlobal = Element.prototype.setAttribute;
+Element.prototype.setAttribute = function(name, value) {
+  var l = String(name).toLowerCase();
+  if (urlAttributes[l] === 1 && typeof value === 'string') {
+    value = proxify(value);
+  }
+  return nativeSetAttributeGlobal.call(this, name, value);
+};
+
+// Belt-and-braces: if something still slipped through, rewrite src/href on
+// insertion via a MutationObserver. Cheap because it only inspects a subset.
+if (window.MutationObserver) {
+  var checkElement = function(el) {
+    if (!el || el.nodeType !== 1) return;
+    var tag = el.tagName ? el.tagName.toLowerCase() : '';
+    if (tag === 'img' || tag === 'script' || tag === 'link' || tag === 'source' || tag === 'video' || tag === 'audio' || tag === 'iframe') {
+      var src = el.getAttribute && el.getAttribute('src');
+      var href = el.getAttribute && el.getAttribute('href');
+      if (src && src.charAt(0) !== '/' && !/^(data|blob|javascript):/i.test(src)) {
+        try { el.setAttribute('src', proxify(src)); } catch (e) {}
+      } else if (src && src.charAt(0) === '/' && src.indexOf('/p/') !== 0 && src.indexOf('/_ws/') !== 0 && src.indexOf('//') !== 0) {
+        try { el.setAttribute('src', proxify(src)); } catch (e) {}
+      }
+      if (href && href.charAt(0) === '/' && href.indexOf('/p/') !== 0 && href.indexOf('/_ws/') !== 0) {
+        try { el.setAttribute('href', proxify(href)); } catch (e) {}
+      }
     }
+  };
+  var observer = new MutationObserver(function(muts) {
+    for (var i = 0; i < muts.length; i++) {
+      var m = muts[i];
+      if (m.type === 'attributes' && m.target) { checkElement(m.target); continue; }
+      if (m.addedNodes) {
+        for (var j = 0; j < m.addedNodes.length; j++) {
+          var node = m.addedNodes[j];
+          checkElement(node);
+          if (node && node.querySelectorAll) {
+            var kids = node.querySelectorAll('img,script,link,source,video,audio,iframe');
+            for (var k = 0; k < kids.length; k++) checkElement(kids[k]);
+          }
+        }
+      }
+    }
+  });
+  observer.observe(document.documentElement, { childList: true, subtree: true, attributes: true, attributeFilter: ['src', 'href'] });
+}
+
+console.log('[proxy] runtime installed target=' + TARGET_BASE);
 
     console.log('[proxy] runtime installed target=' + TARGET_BASE);
   })();</script>`;
@@ -511,13 +563,14 @@ server.on('upgrade', async (req, client, head) => {
     if (explicit) {
       target = decodeTarget(explicit[1]);
       if (explicit[2]) target.pathname = explicit[2];
-      if (local.search) target.search = local.search;
       target.protocol = target.protocol === 'https:' ? 'wss:' : 'ws:';
+      // NOTE: do NOT copy local.search onto target.search. The ?o= param is
+      // for our origin hint only; forwarding it breaks the party server.
       const o = local.searchParams.get('o');
       if (o) try { originOverride = Buffer.from(o, 'base64url').toString('utf8'); } catch {}
       await validatePublicTarget(target);
+      console.log(`[ws] -> ${target.href} origin=${originOverride || '(none)'} sid=${sid.slice(0, 8)}`);
     } else {
-      // Relative /ws upgrade. Find the target via Referer.
       let pageTarget = null;
       const ref = req.headers.referer;
       if (ref) {
@@ -539,10 +592,11 @@ server.on('upgrade', async (req, client, head) => {
       const wsHost = matchIp
         ? `ip_${matchIp}.party.${pageTarget.hostname}`
         : `party.${pageTarget.hostname}`;
-      const search = local.search && !local.searchParams.has('__k') ? local.search : '';
-      target = new URL(`wss://${wsHost}${local.pathname}${search}`);
+      // The browser is on /ws (no query) — do not copy query.
+      target = new URL(`wss://${wsHost}/ws`);
       originOverride = pageTarget.origin;
       await validatePublicTarget(target);
+      console.log(`[ws] fallback -> ${target.href} origin=${originOverride} sid=${sid.slice(0, 8)}`);
     }
   } catch (e) {
     console.log(`[ws] rejected: ${e.message} sid=${sid.slice(0, 8)}`);
