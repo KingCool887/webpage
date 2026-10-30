@@ -129,6 +129,40 @@ function rewriteHtml(html, target) {
 
   // runtime: NO WebSocket monkey-patch. Everything else patched.
   const runtime = `<script>(function(){
+    // --- probe: did the game's main script execute? ---
+    setTimeout(function(){
+      var scripts = Array.prototype.slice.call(document.scripts);
+      var gameScripts = scripts.filter(function(s){
+        return s.src && s.src.indexOf('/p/') !== -1 && /\.js(\?|$)/i.test(s.src);
+      });
+      console.log('[probe] total scripts:', scripts.length, 'proxied js:', gameScripts.length);
+      gameScripts.forEach(function(s){
+        console.log('[probe] script:', s.src, '| readyState:', s.readyState || 'n/a');
+      });
+      var resources = performance.getEntriesByType('resource');
+      var failed = resources.filter(function(r){ return r.transferSize === 0 && r.decodedBodySize === 0 && r.duration > 0; });
+      if (failed.length) {
+        console.warn('[probe] likely failed resources:', failed.map(function(r){ return r.name; }));
+      }
+      if (typeof window.deadshot === 'undefined' && typeof window.game === 'undefined') {
+        console.warn('[probe] no obvious game global found (window.deadshot / window.game)');
+      }
+    }, 6000);
+    // --- probe: Worker errors ---
+    if (window.Worker) {
+      var NativeWorker = window.Worker;
+      window.Worker = function(url, opts){
+        var w = new NativeWorker(url, opts);
+        w.addEventListener('error', function(e){
+          console.error('[probe-worker-err]', e.message, '@', e.filename + ':' + e.lineno);
+        });
+        w.addEventListener('messageerror', function(e){
+          console.error('[probe-worker-msg-err]', e);
+        });
+        return w;
+      };
+      window.Worker.prototype = NativeWorker.prototype;
+    }
     window.addEventListener('error', function(e){
       console.error('[proxy-err]', e.message, '@', e.filename + ':' + e.lineno + ':' + e.colno, e.error);
     });
