@@ -1,251 +1,142 @@
 const http = require('node:http');
-const https = require('node:https');
-const crypto = require('node:crypto');
 const fs = require('node:fs');
 const path = require('node:path');
 const net = require('node:net');
 const tls = require('node:tls');
-const zlib = require('node:zlib');
+const crypto = require('node:crypto');
 const { lookup } = require('node:dns/promises');
 const { Readable } = require('node:stream');
 
 const HOST = '127.0.0.1';
 const BIND_ADDRESS = process.env.BIND_ADDRESS || '0.0.0.0';
 const PORT = Number(process.env.PORT || 8787);
-const MAX_REQUEST_BYTES = 32 * 1024 * 1024;
 const PAGE_PATH = path.join(__dirname, 'index.html');
 const USERS_PATH = path.join(__dirname, 'users.json');
 const COOKIE_NAME = '__proxy_access';
-const LOG_LIMIT = 3000;
+const MAX_REQUEST_BYTES = 32 * 1024 * 1024;
+const MAX_WS_PER_SESSION = 20;
 
-// Bodies sent to these hosts get captured (up to 8 KB) so we can see what the
-// game reports when it says "couldn't load game".
-const BODY_CAPTURE_HOST = /error|report|crash|sentry|bugsnag|rollbar|telemetry/i;
+const lastMatchIpByTarget = new Map();   // `${sessionId}:${targetOrigin}` -> 32-hex
+const proxyHostTargets = new Map();       // sanitized req.host -> target origin (for legacy /ws)
+const wsCountByKey = new Map();
 
-// ---------- Logging ----------
-
-let logSeq = 0;
-const recentLogs = [];
-
-function recordLog(entry) {
-  entry.id = ++logSeq;
-  entry.ts = new Date().toISOString();
-  recentLogs.push(entry);
-  if (recentLogs.length > LOG_LIMIT) recentLogs.shift();
-  try {
-    if (entry.kind === 'client') {
-      console.log(`[client:${entry.level || 'info'}] ${entry.msg || ''} ${entry.extra ? JSON.stringify(entry.extra) : ''}`);
-    } else {
-      console.log(`[${entry.kind || 'info'}] ${JSON.stringify(entry)}`);
-    }
-  } catch { /* ignore */ }
-}
-
-// ---------- Users / auth ----------
-
+// ---------- users ----------
 let VALID_KEYS = new Set();
 try {
   const raw = JSON.parse(fs.readFileSync(USERS_PATH, 'utf8'));
   const list = Array.isArray(raw.keys) ? raw.keys : [];
   VALID_KEYS = new Set(list.filter(u => u && u.active !== false).map(u => u.key));
-  console.log(`Loaded ${VALID_KEYS.size} active key(s) from users.json`);
+  console.log(`Loaded ${VALID_KEYS.size} active key(s)`);
 } catch (e) {
-  console.error('Failed to load users.json:', e.message);
+  console.error('users.json failed:', e.message);
 }
 
 function keyFromCookie(header) {
   const m = (header || '').match(new RegExp(`(?:^|;\\s*)${COOKIE_NAME}=([^;]+)`));
   return m ? decodeURIComponent(m[1]) : null;
 }
-
 function isAuthed(req) {
-  const key = keyFromCookie(req.headers.cookie);
-  return !!(key && VALID_KEYS.has(key));
+  const k = keyFromCookie(req.headers.cookie);
+  return !!(k && VALID_KEYS.has(k));
+}
+function sessionId(req) {
+  return keyFromCookie(req.headers.cookie) || 'anon';
 }
 
 function checkAuth(req, res) {
   const url = new URL(req.url, `http://${HOST}:${PORT}`);
-  const queryKey = url.searchParams.get('key');
-
-  if (queryKey) {
-    if (!VALID_KEYS.has(queryKey)) {
-      res.writeHead(401, { 'Content-Type': 'text/plain; charset=utf-8' });
-      res.end('Access denied: unknown key.');
-      return false;
+  const q = url.searchParams.get('key');
+  if (q) {
+    if (!VALID_KEYS.has(q)) {
+      res.writeHead(401, { 'Content-Type': 'text/plain' });
+      return res.end('Unknown key.'), false;
     }
     url.searchParams.delete('key');
-    const cleanPath = url.pathname + (url.search || '');
-    const secure = (req.headers['x-forwarded-proto'] === 'https') ||
-                   (req.socket && req.socket.encrypted) ? '; Secure' : '';
+    const secure = req.headers['x-forwarded-proto'] === 'https' ? '; Secure' : '';
     res.writeHead(302, {
-      'Location': cleanPath,
-      'Set-Cookie': `${COOKIE_NAME}=${encodeURIComponent(queryKey)}; HttpOnly; SameSite=Lax; Path=/; Max-Age=604800${secure}`,
+      Location: url.pathname + (url.search || ''),
+      'Set-Cookie': `${COOKIE_NAME}=${encodeURIComponent(q)}; HttpOnly; SameSite=Lax; Path=/; Max-Age=604800${secure}`,
       'Cache-Control': 'no-store',
     });
-    res.end();
-    return false;
+    return res.end(), false;
   }
-
   if (!isAuthed(req)) {
-    res.writeHead(401, { 'Content-Type': 'text/plain; charset=utf-8' });
-    res.end('Access denied. Open this URL with ?key=<your-key> once to get a session cookie.');
-    return false;
+    res.writeHead(401, { 'Content-Type': 'text/plain' });
+    return res.end('Add ?key=<yours> once.'), false;
   }
   return true;
 }
 
-// ---------- Target encoding ----------
-
-function encodeTarget(value) {
-  return Buffer.from(value, 'utf8').toString('base64url');
+// ---------- targets ----------
+function encodeTarget(v) { return Buffer.from(v, 'utf8').toString('base64url'); }
+function decodeTarget(v) {
+  if (!/^[A-Za-z0-9_-]{1,12000}$/.test(v)) throw new Error('Invalid address.');
+  const t = new URL(Buffer.from(v, 'base64url').toString('utf8'));
+  if (!['http:', 'https:'].includes(t.protocol)) throw new Error('Only HTTP(S).');
+  return t;
 }
+function proxyPath(t) { return `/p/${encodeTarget(t.origin)}${t.pathname}${t.search}`; }
 
-function decodeTarget(value) {
-  if (!/^[A-Za-z0-9_-]{1,12000}$/.test(value)) throw new Error('Invalid proxy address.');
-  const target = new URL(Buffer.from(value, 'base64url').toString('utf8'));
-  if (!['http:', 'https:'].includes(target.protocol)) throw new Error('Only HTTP and HTTPS are supported.');
-  return target;
-}
-
-function isPrivateAddress(address) {
-  const family = net.isIP(address);
-  if (family === 4) {
-    const [a, b] = address.split('.').map(Number);
-    return a === 0 || a === 10 || a === 127 || (a === 169 && b === 254) ||
-           (a === 172 && b >= 16 && b <= 31) || (a === 192 && b === 168) || a >= 224;
+function isPrivateAddress(a) {
+  const f = net.isIP(a);
+  if (f === 4) {
+    const [x, y] = a.split('.').map(Number);
+    return x === 0 || x === 10 || x === 127 || (x === 169 && y === 254)
+      || (x === 172 && y >= 16 && y <= 31) || (x === 192 && y === 168) || x >= 224;
   }
-  if (family === 6) return address === '::' || address === '::1' || address.startsWith('fc') ||
-                         address.startsWith('fd') || address.startsWith('fe8');
+  if (f === 6) return a === '::' || a === '::1' || a.startsWith('fc') || a.startsWith('fd') || a.startsWith('fe8');
   return true;
 }
-
-async function validatePublicTarget(target) {
-  const hostname = target.hostname.toLowerCase();
-  if (hostname === 'localhost' || hostname.endsWith('.localhost') || hostname.endsWith('.local')) {
-    throw new Error('Local addresses not supported.');
-  }
-  if (net.isIP(hostname)) {
-    if (isPrivateAddress(hostname)) throw new Error('Private addresses not supported.');
-    return;
-  }
-  const answers = await lookup(hostname, { all: true, verbatim: true });
-  if (!answers.length || answers.some(a => isPrivateAddress(a.address))) {
-    throw new Error('Did not resolve to public.');
-  }
+async function validatePublicTarget(t) {
+  const h = t.hostname.toLowerCase();
+  if (h === 'localhost' || h.endsWith('.localhost') || h.endsWith('.local')) throw new Error('Local addr.');
+  if (net.isIP(h)) { if (isPrivateAddress(h)) throw new Error('Private addr.'); return; }
+  const ans = await lookup(h, { all: true, verbatim: true });
+  if (!ans.length || ans.some(a => isPrivateAddress(a.address))) throw new Error('Did not resolve public.');
 }
 
-// ---------- URL rewriting ----------
-
-function proxyPath(target) {
-  return `/p/${encodeTarget(target.origin)}${target.pathname}${target.search}`;
-}
-
-function resolveLink(value, base) {
-  const raw = value.trim();
-  if (!raw || raw.startsWith('#') || /^(data:|blob:|javascript:|mailto:|tel:|about:)/i.test(raw)) return value;
+// ---------- rewriting ----------
+function resolveLink(v, base) {
+  const raw = v.trim();
+  if (!raw || raw.startsWith('#') || /^(data:|blob:|javascript:|mailto:|tel:|about:)/i.test(raw)) return v;
   try {
-    const resolved = new URL(raw, base);
-    if (!['http:', 'https:'].includes(resolved.protocol)) return value;
-    return proxyPath(resolved);
-  } catch { return value; }
+    const r = new URL(raw, base);
+    if (!['http:', 'https:'].includes(r.protocol)) return v;
+    return proxyPath(r);
+  } catch { return v; }
 }
-
 function rewriteCss(css, base) {
-  return css.replace(/url\(\s*(['"]?)(.*?)\1\s*\)/gi, (m, q, v) => `url("${resolveLink(v, base)}")`);
+  return css
+    .replace(/url\(\s*(['"]?)(.*?)\1\s*\)/gi, (m, q, v) => `url("${resolveLink(v, base)}")`)
+    .replace(/@import\s+(?:url\()?\s*(['"])(.*?)\1\s*\)?/gi, (m, q, v) => `@import url("${resolveLink(v, base)}")`);
 }
 
 function rewriteHtml(html, target) {
-  const attrNames = ['href', 'src', 'action', 'formaction', 'poster', 'data', 'xlink:href'];
-  const attrPattern = new RegExp(`(\\b(?:${attrNames.join('|')})\\s*=\\s*)(["'])(.*?)\\2`, 'gis');
-  let rewritten = html.replace(attrPattern, (m, p, q, v) => `${p}${q}${resolveLink(v, target)}${q}`);
-  rewritten = rewritten.replace(/<meta\b[^>]*http-equiv\s*=\s*(["'])?content-security-policy\1?[^>]*>/gi, '');
+  const attrs = ['href', 'src', 'action', 'formaction', 'poster', 'data', 'xlink:href'];
+  const ap = new RegExp(`(\\b(?:${attrs.join('|')})\\s*=\\s*)(["'])(.*?)\\2`, 'gis');
+  let out = html.replace(ap, (m, p, q, v) => `${p}${q}${resolveLink(v, target)}${q}`);
+  out = out.replace(/<meta\b[^>]*http-equiv\s*=\s*(["'])?content-security-policy\1?[^>]*>/gi, '');
+  out = out.replace(/srcset\s*=\s*(["'])(.*?)\1/gis, (m, q, v) => {
+    const items = v.split(',').map(item => {
+      const parts = item.trim().split(/\s+/);
+      if (parts[0]) parts[0] = resolveLink(parts[0], target);
+      return parts.join(' ');
+    });
+    return `srcset=${q}${items.join(', ')}${q}`;
+  });
+  out = out.replace(/<style\b([^>]*)>([\s\S]*?)<\/style\s*>/gi, (m, a, css) => `<style${a}>${rewriteCss(css, target)}</style>`);
+  out = out.replace(/\sstyle=(['"])(.*?)\1/gi, (m, q, css) => ` style=${q}${rewriteCss(css, target)}${q}`);
 
+  // runtime: NO WebSocket monkey-patch. Everything else patched.
   const runtime = `<script>(function(){
     var TARGET_BASE = ${JSON.stringify(target.origin)};
     var TARGET_HOSTNAME = new URL(TARGET_BASE).hostname;
     var NATIVE_FETCH = window.fetch.bind(window);
     var NATIVE_BEACON = navigator.sendBeacon ? navigator.sendBeacon.bind(navigator) : null;
 
-    // ---- client-side logging ----
-    var LOG_ENDPOINT = '/__log';
-    var LOG_BATCH = 25;
-    var logBuffer = [];
+    function encode(v){ return btoa(unescape(encodeURIComponent(v))).replace(/\\+/g,'-').replace(/\\//g,'_').replace(/=+$/g,''); }
 
-    function shipLogs(useBeacon) {
-      if (!logBuffer.length) return;
-      var payload = JSON.stringify(logBuffer.splice(0, logBuffer.length));
-      try {
-        if (useBeacon && NATIVE_BEACON) NATIVE_BEACON(LOG_ENDPOINT, payload);
-        else NATIVE_FETCH(LOG_ENDPOINT, {
-          method: 'POST', headers: { 'content-type': 'application/json' },
-          credentials: 'include', body: payload, keepalive: true
-        }).catch(function(){});
-      } catch (e) {}
-    }
-
-    function plog(level, msg, extra) {
-      var entry = { level: level, msg: String(msg), page: location.pathname, t: Date.now() };
-      if (extra) for (var k in extra) { try { entry[k] = extra[k]; } catch(e){} }
-      logBuffer.push(entry);
-      try { console.log('[proxy-log]', level, msg, extra || ''); } catch(e){}
-      if (logBuffer.length >= LOG_BATCH) shipLogs(false);
-    }
-
-    setInterval(function(){ shipLogs(false); }, 3000);
-    window.addEventListener('pagehide', function(){ shipLogs(true); });
-    window.addEventListener('beforeunload', function(){ shipLogs(true); });
-
-    window.addEventListener('error', function(e){
-      try {
-        if (e && e.target && e.target !== window && e.target.tagName) {
-          plog('error', 'resource-fail', { tag: e.target.tagName, src: String(e.target.src || e.target.href || '') });
-        } else {
-          plog('error', 'script-error', {
-            message: e && e.message, filename: e && e.filename,
-            line: e && e.lineno, col: e && e.colno,
-            stack: e && e.error && e.error.stack
-          });
-        }
-      } catch (x) {}
-    }, true);
-
-    window.addEventListener('unhandledrejection', function(e){
-      try {
-        var r = e && e.reason;
-        plog('error', 'unhandled-rejection', { message: r && (r.message || String(r)), stack: r && r.stack });
-      } catch (x) {}
-    });
-
-    // ---- capability snapshot (once, at startup) ----
-    (function reportCaps(){
-      try {
-        var caps = {
-          crossOriginIsolated: window.crossOriginIsolated === true,
-          sharedArrayBuffer: typeof SharedArrayBuffer !== 'undefined',
-          atomics: typeof Atomics !== 'undefined',
-          wasm: typeof WebAssembly === 'object' && typeof WebAssembly.instantiate === 'function',
-          baseURI: document.baseURI,
-          href: location.href,
-          origin: location.origin,
-          hostname: location.hostname,
-          top: window === window.top,
-          inIframe: window.top !== window.self
-        };
-        try {
-          var c = document.createElement('canvas');
-          caps.webgl2 = !!c.getContext('webgl2');
-          caps.webgl = !!(c.getContext('webgl') || c.getContext('experimental-webgl'));
-        } catch (e) { caps.webglErr = e.message; }
-        plog('info', 'capabilities', caps);
-      } catch (e) { plog('error', 'capability check failed', { message: e.message }); }
-    })();
-
-    // ---- URL proxify ----
-    function encode(value) {
-      return btoa(unescape(encodeURIComponent(value))).replace(/\\+/g,'-').replace(/\\//g,'_').replace(/=+$/g,'');
-    }
-
-    function proxify(value) {
+    function proxify(value){
       if (typeof value !== 'string') value = String(value);
       if (/^(data:|blob:|javascript:|mailto:|tel:|about:)/i.test(value)) return value;
       try {
@@ -253,157 +144,75 @@ function rewriteHtml(html, target) {
         if (current.protocol !== 'http:' && current.protocol !== 'https:') return value;
         if (current.hostname.indexOf('.') < 0) return value;
         if (current.pathname.indexOf('/p/') === 0) return current.pathname + current.search;
-        if (current.pathname.indexOf('/__') === 0) return current.pathname + current.search;
         if (current.pathname.indexOf('/_ws/') === 0) return current.pathname + current.search;
-        if (current.hostname === window.location.hostname) {
-          return '/p/' + encode(TARGET_BASE) + current.pathname + current.search;
-        }
         return '/p/' + encode(current.origin) + current.pathname + current.search;
       } catch (e) { return value; }
     }
 
-    // ---- fetch ----
-    window.fetch = function(input, init) {
-      var request;
-      try { request = input instanceof Request ? input : new Request(input, init); }
-      catch (e) { plog('error', 'fetch construct failed', { message: e.message }); return Promise.reject(e); }
-      var method = request.method || 'GET';
+    // fetch
+    window.fetch = async function(input, init){
+      var request = input instanceof Request ? input : new Request(input, init);
       var proxified = proxify(request.url);
-      var started = (window.performance && performance.now()) || Date.now();
-      var bodyPromise = Promise.resolve(undefined);
-      if (request.body && method !== 'GET' && method !== 'HEAD') {
-        try { bodyPromise = request.clone().arrayBuffer(); } catch (e) { bodyPromise = Promise.resolve(undefined); }
+      var opts = {
+        method: request.method, headers: request.headers,
+        mode: request.mode === 'navigate' ? 'cors' : request.mode,
+        credentials: 'include',
+        cache: request.cache, redirect: request.redirect,
+        integrity: request.integrity, signal: request.signal
+      };
+      if (request.body && request.method !== 'GET' && request.method !== 'HEAD') {
+        opts.body = await request.clone().arrayBuffer();
       }
-      return bodyPromise.then(function(bodyBuf){
-        var opts = {
-          method: method, headers: request.headers,
-          mode: request.mode === 'navigate' ? 'cors' : (request.mode || 'cors'),
-          credentials: 'include', cache: request.cache, redirect: request.redirect,
-          integrity: request.integrity, signal: request.signal
-        };
-        if (bodyBuf) opts.body = bodyBuf;
-        return NATIVE_FETCH(proxified, opts).then(function(resp){
-          var ms = Math.round(((window.performance && performance.now()) || Date.now()) - started);
-          plog(resp.ok ? 'info' : 'error', method + ' ' + request.url + ' -> ' + resp.status + ' (' + ms + 'ms)');
-          return resp;
-        }, function(err){
-          var ms = Math.round(((window.performance && performance.now()) || Date.now()) - started);
-          plog('error', method + ' ' + request.url + ' FAILED after ' + ms + 'ms: ' + (err && err.message));
-          throw err;
-        });
-      });
+      return NATIVE_FETCH(proxified, opts);
     };
 
-    // ---- XHR ----
+    // XHR
     var nativeOpen = XMLHttpRequest.prototype.open;
-    var nativeSend = XMLHttpRequest.prototype.send;
-    XMLHttpRequest.prototype.open = function(method, url) {
-      this.__proxyUrl = String(url);
+    XMLHttpRequest.prototype.open = function(method, url){
       var args = Array.prototype.slice.call(arguments);
       args[1] = proxify(String(url));
       return nativeOpen.apply(this, args);
     };
-    XMLHttpRequest.prototype.send = function(body) {
-      var xhr = this;
-      var started = (window.performance && performance.now()) || Date.now();
-      xhr.addEventListener('loadend', function(){
-        var ms = Math.round(((window.performance && performance.now()) || Date.now()) - started);
-        var ok = xhr.status >= 200 && xhr.status < 400;
-        plog(ok ? 'info' : 'error', 'XHR ' + (xhr.__proxyUrl || '') + ' -> ' + xhr.status + ' (' + ms + 'ms)');
-      });
-      return nativeSend.call(xhr, body);
-    };
 
-    // ---- WebSocket ----
-    var NativeWebSocket = window.WebSocket;
-    window.WebSocket = function(url, protocols) {
-      var newUrl = String(url);
-      try {
-        if (newUrl.indexOf('/_ws/') === 0) return new NativeWebSocket(newUrl, protocols);
-        var wsProto = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-        var resolved;
-        if (newUrl.indexOf('ws://') === 0 || newUrl.indexOf('wss://') === 0) resolved = new URL(newUrl);
-        else if (newUrl.indexOf('//') === 0) resolved = new URL(wsProto + newUrl);
-        else if (newUrl.charAt(0) === '/') resolved = new URL(wsProto + '//party.' + TARGET_HOSTNAME + newUrl);
-        else return new NativeWebSocket(newUrl, protocols);
-
-        var finalUrl;
-        if (resolved.hostname === window.location.hostname) {
-          finalUrl = wsProto + '//party.' + TARGET_HOSTNAME + resolved.pathname + resolved.search;
-        } else {
-          finalUrl = resolved.origin + resolved.pathname + resolved.search;
-        }
-        newUrl = wsProto + '//' + window.location.host + '/_ws/' + encode(finalUrl);
-        plog('info', 'WS ' + url + ' -> ' + newUrl);
-      } catch (e) { plog('error', 'WS rewrite failed for ' + url + ': ' + (e && e.message)); }
-      var sock = new NativeWebSocket(newUrl, protocols);
-      sock.addEventListener('open', function(){ plog('info', 'WS open ' + newUrl); });
-      sock.addEventListener('error', function(){ plog('error', 'WS error ' + newUrl); });
-      sock.addEventListener('close', function(ev){ plog('info', 'WS close ' + newUrl + ' code=' + (ev && ev.code)); });
-      return sock;
-    };
-    window.WebSocket.prototype = NativeWebSocket.prototype;
-    window.WebSocket.CONNECTING = NativeWebSocket.CONNECTING;
-    window.WebSocket.OPEN = NativeWebSocket.OPEN;
-    window.WebSocket.CLOSING = NativeWebSocket.CLOSING;
-    window.WebSocket.CLOSED = NativeWebSocket.CLOSED;
-
-    // ---- sendBeacon ----
+    // sendBeacon
     if (NATIVE_BEACON) {
-      navigator.sendBeacon = function(url, data) {
-        try {
-          var p = proxify(String(url));
-          if (p.indexOf('/__') !== 0) plog('info', 'beacon ' + url + ' -> ' + p);
-          return NATIVE_BEACON(p, data);
-        } catch (e) { return NATIVE_BEACON(url, data); }
+      navigator.sendBeacon = function(url, data){
+        try { return NATIVE_BEACON(proxify(String(url)), data); }
+        catch (e) { return NATIVE_BEACON(url, data); }
       };
     }
 
-    // ---- Worker (with error listener) ----
-    if (window.Worker) {
-      var NativeWorker = window.Worker;
-      window.Worker = function(url, opts) {
-        plog('info', 'Worker create ' + url);
-        var w;
-        try { w = new NativeWorker(url, opts); }
-        catch (e) { plog('error', 'Worker construct failed ' + url + ': ' + (e && e.message)); throw e; }
-        w.addEventListener('error', function(ev){
-          plog('error', 'Worker error ' + url, {
-            message: ev && ev.message, filename: ev && ev.filename, lineno: ev && ev.lineno
-          });
-        });
-        return w;
-      };
-      window.Worker.prototype = NativeWorker.prototype;
+    // EventSource
+    if (window.EventSource) {
+      var ES = window.EventSource;
+      window.EventSource = function(url, opts){ return new ES(proxify(String(url)), opts); };
+      window.EventSource.prototype = ES.prototype;
+      window.EventSource.CONNECTING = ES.CONNECTING;
+      window.EventSource.OPEN = ES.OPEN;
+      window.EventSource.CLOSED = ES.CLOSED;
     }
 
-    // ---- Service worker ----
-    if (navigator.serviceWorker) {
-      var nativeRegister = navigator.serviceWorker.register;
-      navigator.serviceWorker.register = function(scriptURL, options) {
-        var p = proxify(String(scriptURL));
-        plog('info', 'SW register ' + scriptURL + ' -> ' + p);
-        return nativeRegister.call(this, p, options);
-      };
-    }
+    // window.open
+    var nativeOpen2 = window.open.bind(window);
+    window.open = function(url){ return nativeOpen2(proxify(String(url))); };
 
-    // ---- createElement ----
-    var originalCreateElement = document.createElement.bind(document);
-    document.createElement = function(tagName) {
-      var el = originalCreateElement(tagName);
-      if (tagName && (tagName.toLowerCase() === 'script' || tagName.toLowerCase() === 'link' || tagName.toLowerCase() === 'img')) {
-        var nativeSetAttribute = el.setAttribute;
-        el.setAttribute = function(name, value) {
-          var lower = String(name).toLowerCase();
-          if (lower === 'src' || lower === 'href') value = proxify(String(value));
-          return nativeSetAttribute.call(el, name, value);
+    // createElement + setAttribute
+    var nativeCreate = document.createElement.bind(document);
+    document.createElement = function(tag){
+      var el = nativeCreate(tag);
+      if (tag && (tag.toLowerCase() === 'script' || tag.toLowerCase() === 'link' || tag.toLowerCase() === 'img')) {
+        var nativeSet = el.setAttribute;
+        el.setAttribute = function(name, value){
+          var l = String(name).toLowerCase();
+          if (l === 'src' || l === 'href') value = proxify(String(value));
+          return nativeSet.call(el, name, value);
         };
       }
       return el;
     };
 
-    // ---- DOM property patch ----
-    function patchUrlProperty(proto, prop) {
+    // URL property patches
+    function patch(proto, prop){
       var d = Object.getOwnPropertyDescriptor(proto, prop);
       if (!d || !d.get || !d.set || !d.configurable) return;
       Object.defineProperty(proto, prop, {
@@ -412,310 +221,344 @@ function rewriteHtml(html, target) {
         set: function(v){ d.set.call(this, typeof v === 'string' ? proxify(v) : v); }
       });
     }
-    patchUrlProperty(HTMLIFrameElement.prototype, 'src');
-    patchUrlProperty(HTMLScriptElement.prototype, 'src');
-    patchUrlProperty(HTMLImageElement.prototype, 'src');
-    patchUrlProperty(HTMLLinkElement.prototype, 'href');
-    patchUrlProperty(HTMLMediaElement.prototype, 'src');
-    patchUrlProperty(HTMLSourceElement.prototype, 'src');
-    patchUrlProperty(HTMLVideoElement.prototype, 'poster');
+    patch(HTMLIFrameElement.prototype, 'src');
+    patch(HTMLScriptElement.prototype, 'src');
+    patch(HTMLImageElement.prototype, 'src');
+    patch(HTMLLinkElement.prototype, 'href');
+    patch(HTMLAnchorElement.prototype, 'href');
+    patch(HTMLSourceElement.prototype, 'src');
+    patch(HTMLMediaElement.prototype, 'src');
+    patch(HTMLVideoElement.prototype, 'poster');
+    patch(HTMLFormElement.prototype, 'action');
 
-    plog('info', 'runtime installed', { target: TARGET_BASE, href: location.href });
+    // Service worker register
+    if (navigator.serviceWorker) {
+      var nativeReg = navigator.serviceWorker.register;
+      navigator.serviceWorker.register = function(scriptURL, opts){
+        return nativeReg.call(this, proxify(String(scriptURL)), opts);
+      };
+    }
+
+    console.log('[proxy] runtime installed target=' + TARGET_BASE);
   })();</script>`;
 
-  if (/<head\b[^>]*>/i.test(rewritten)) rewritten = rewritten.replace(/<head\b[^>]*>/i, h => `${h}${runtime}`);
-  else rewritten = runtime + rewritten;
-  return rewritten;
+  if (/<head\b[^>]*>/i.test(out)) out = out.replace(/<head\b[^>]*>/i, h => `${h}${runtime}`);
+  else out = runtime + out;
+  return out;
 }
 
-// ---------- Proxying ----------
+// ---------- cookies ----------
+function rewriteSetCookie(cookie, target) {
+  const prefix = `/p/${encodeTarget(target.origin)}`;
+  let out = cookie.replace(/;\s*domain=[^;]*/i, '');
+  out = out.replace(/;\s*path=([^;]*)/i, (m, p) => {
+    const raw = (p.trim() || '/');
+    const norm = raw.startsWith('/') ? raw : `/${raw}`;
+    return `; Path=${prefix}${norm === '/' ? '' : norm}`;
+  });
+  if (!/;\s*path=/i.test(out)) out += `; Path=${prefix}`;
+  if (/;\s*SameSite=(Lax|Strict)/i.test(out)) out = out.replace(/;\s*SameSite=(Lax|Strict)/i, '; SameSite=None');
+  else if (!/;\s*SameSite=/i.test(out)) out += '; SameSite=None';
+  if (!/;\s*Secure/i.test(out)) out += '; Secure';
+  return out;
+}
 
+// ---------- request forwarding ----------
 async function readRequestBody(req) {
   const chunks = []; let size = 0;
-  for await (const chunk of req) {
-    size += chunk.length;
+  for await (const c of req) {
+    size += c.length;
     if (size > MAX_REQUEST_BYTES) throw new Error('Too large');
-    chunks.push(chunk);
+    chunks.push(c);
   }
   return size ? Buffer.concat(chunks) : undefined;
 }
 
-function rewriteSetCookie(header) {
-  return header.replace(/;\s*domain=[^;]*/gi, '');
-}
-
-function maybeLogErrorReport(target, req, body) {
-  if (!body || body.length > 50_000) return;
-  if (!BODY_CAPTURE_HOST.test(target.hostname)) return;
-  let text = '';
-  const enc = String(req.headers['content-encoding'] || '').toLowerCase();
-  try {
-    if (enc === 'gzip') text = zlib.gunzipSync(body).toString('utf8');
-    else if (enc === 'deflate') text = zlib.inflateSync(body).toString('utf8');
-    else if (enc === 'br') text = zlib.brotliDecompressSync(body).toString('utf8');
-    else text = body.toString('utf8');
-  } catch (e) { text = '<decode failed: ' + e.message + '>'; }
-  recordLog({
-    kind: 'error-report',
-    target: target.href,
-    ctype: req.headers['content-type'] || '',
-    encoding: enc || null,
-    len: body.length,
-    body: text.slice(0, 8000),
-  });
-}
-
 async function proxyRequest(req, res, target) {
   const started = Date.now();
-  res.on('finish', () => {
-    recordLog({
-      kind: 'server',
-      method: req.method,
-      target: target.href,
-      status: res.statusCode,
-      ms: Date.now() - started,
-      ctype: String(res.getHeader('content-type') || ''),
-    });
-  });
-
-  try { await validatePublicTarget(target); }
-  catch (e) {
-    recordLog({ kind: 'server-error', target: target.href, error: 'validatePublicTarget: ' + e.message });
-    res.writeHead(502, { 'Content-Type': 'text/plain; charset=utf-8' });
-    return res.end('Upstream blocked: ' + e.message);
-  }
+  await validatePublicTarget(target);
+  proxyHostTargets.set(String(req.headers.host || '').split(':')[0], target.origin);
 
   const headers = new Headers();
   for (const [name, value] of Object.entries(req.headers)) {
     const lower = name.toLowerCase();
-    if (['host', 'connection', 'content-length', 'origin', 'referer', 'cookie'].includes(lower)) continue;
+    if (['host', 'connection', 'content-length', 'accept-encoding', 'origin', 'referer', 'cookie'].includes(lower)) continue;
     if (Array.isArray(value)) headers.set(name, value.join(', '));
     else headers.set(name, value);
   }
-  const cookie = req.headers.cookie || '';
-  const cleanCookie = cookie.split(';').map(c => c.trim())
+  const cookie = (req.headers.cookie || '').split(';').map(c => c.trim())
     .filter(c => c && !c.startsWith(COOKIE_NAME + '=')).join('; ');
-  if (cleanCookie) headers.set('cookie', cleanCookie);
+  if (cookie) headers.set('cookie', cookie);
   if (req.headers.origin) headers.set('origin', target.origin);
+  if (req.headers.referer) {
+    try {
+      const r = new URL(req.headers.referer);
+      const m = r.pathname.match(/^\/p\/([A-Za-z0-9_-]+)/);
+      if (m) headers.set('referer', decodeTarget(m[1]).href);
+    } catch {}
+  }
 
   const body = ['GET', 'HEAD'].includes(req.method) ? undefined : await readRequestBody(req);
-  if (body) maybeLogErrorReport(target, req, body);
+  const upstream = await fetch(target, { method: req.method, headers, body, redirect: 'manual' });
 
-  let upstream;
-  try { upstream = await fetch(target, { method: req.method, headers, body, redirect: 'manual' }); }
-  catch (e) {
-    recordLog({ kind: 'server-error', target: target.href, error: 'fetch upstream: ' + e.message });
-    res.writeHead(502, { 'Content-Type': 'text/plain; charset=utf-8' });
-    return res.end('Upstream fetch failed: ' + e.message);
+  const out = new Headers(upstream.headers);
+  for (const n of ['content-security-policy','content-security-policy-report-only','x-frame-options',
+                   'cross-origin-opener-policy','cross-origin-embedder-policy','cross-origin-resource-policy',
+                   'permissions-policy','access-control-allow-origin','access-control-allow-credentials',
+                   'content-encoding','content-length','transfer-encoding','connection','set-cookie','alt-svc']) {
+    out.delete(n);
   }
+  const ct = upstream.headers.get('content-type') || '';
+  if (/text\/html|application\/xhtml\+xml/i.test(ct)) out.set('cache-control', 'no-store');
 
-  const outHeaders = new Headers(upstream.headers);
-  for (const name of ['content-security-policy', 'x-frame-options', 'content-encoding',
-                      'content-length', 'transfer-encoding', 'connection', 'set-cookie']) {
-    outHeaders.delete(name);
-  }
+  const acao = req.headers.origin || '*';
+  out.set('access-control-allow-origin', acao);
+  out.set('access-control-allow-credentials', 'true');
+  out.set('access-control-allow-methods', 'GET,HEAD,POST,PUT,PATCH,DELETE,OPTIONS');
+  out.set('access-control-allow-headers', req.headers['access-control-request-headers'] || '*');
+  out.set('access-control-expose-headers', 'Content-Length, Content-Range, Accept-Ranges, Content-Type');
+  out.set('referrer-policy', 'same-origin');
 
-  if (typeof upstream.headers.getSetCookie === 'function') {
-    for (const c of upstream.headers.getSetCookie()) outHeaders.append('set-cookie', rewriteSetCookie(c));
-  } else {
-    const single = upstream.headers.get('set-cookie');
-    if (single) outHeaders.set('set-cookie', rewriteSetCookie(single));
-  }
-
-  outHeaders.set('Cross-Origin-Opener-Policy', 'same-origin');
-  outHeaders.set('Cross-Origin-Embedder-Policy', 'credentialless');
-  outHeaders.set('referrer-policy', 'same-origin');
-  outHeaders.set('access-control-allow-origin', '*');
-  outHeaders.set('access-control-allow-credentials', 'true');
+  const cookies = typeof upstream.headers.getSetCookie === 'function'
+    ? upstream.headers.getSetCookie()
+    : (upstream.headers.get('set-cookie') || '').split(/,(?=\s*[^;,]+=)/).filter(Boolean);
+  const setCookie = cookies.map(c => rewriteSetCookie(c, target));
 
   const location = upstream.headers.get('location');
-  if (location) {
-    try { outHeaders.set('location', proxyPath(new URL(location, target))); } catch {}
-  }
-
-  const contentType = upstream.headers.get('content-type') || '';
+  if (location) { try { out.set('location', proxyPath(new URL(location, target))); } catch {} }
 
   const headerObj = {};
-  for (const [k, v] of outHeaders.entries()) {
-    if (k.toLowerCase() === 'set-cookie') (headerObj['set-cookie'] ||= []).push(v);
-    else headerObj[k] = v;
-  }
+  for (const [k, v] of out.entries()) headerObj[k] = v;
+  if (setCookie.length) headerObj['set-cookie'] = setCookie;
 
-  if (/text\/html/i.test(contentType)) {
+  if (/text\/html|application\/xhtml\+xml/i.test(ct)) {
     const html = rewriteHtml(await upstream.text(), target);
     headerObj['content-type'] = 'text/html; charset=utf-8';
     res.writeHead(upstream.status, headerObj);
     return res.end(html);
   }
-  if (/text\/css/i.test(contentType)) {
+  if (/text\/css/i.test(ct)) {
     const css = rewriteCss(await upstream.text(), target);
     headerObj['content-type'] = 'text/css; charset=utf-8';
     res.writeHead(upstream.status, headerObj);
     return res.end(css);
   }
+  if (/application\/json|text\/plain/i.test(ct)) {
+    const text = await upstream.text();
+    // Rewrite any wss:// URL embedded in JSON (party server style) to /_ws/<token>?o=<origin>
+    const originToken = Buffer.from(target.origin, 'utf8').toString('base64url');
+    const rewritten = text.replace(/(["'])wss?:\/\/[^"']+\1/gi, (match, q) => {
+      const url = match.slice(1, -1);
+      const encoded = Buffer.from(url.replace(/^wss:\/\//i, 'https://').replace(/^ws:\/\//i, 'http://')).toString('base64url');
+      return `${q}ws://${req.headers.host}/_ws/${encoded}?o=${originToken}${q}`;
+    });
+    headerObj['content-type'] = 'application/json; charset=utf-8';
+    res.writeHead(upstream.status, headerObj);
+    return res.end(rewritten);
+  }
 
   res.writeHead(upstream.status, headerObj);
   if (!upstream.body || req.method === 'HEAD') return res.end();
-  Readable.fromWeb(upstream.body).pipe(res);
+  const ds = Readable.fromWeb(upstream.body);
+  ds.on('error', () => { if (!res.destroyed) res.destroy(); });
+  res.on('close', () => { if (!res.writableFinished) ds.destroy(); });
+  ds.pipe(res);
 }
 
-// ---------- WS relay ----------
+// ---------- WebSocket relay ----------
+async function relayUpgrade(req, client, head, target, originOverride, sid) {
+  if (client.parser) client.parser = null;
+  client.setNoDelay(true);
+  client.setKeepAlive(true, 30000);
 
-async function relayUpgrade(req, client, head, target) {
   const secure = target.protocol === 'wss:';
   const port = Number(target.port) || (secure ? 443 : 80);
   const upstream = secure
     ? tls.connect({ host: target.hostname, port, servername: target.hostname })
     : net.connect({ host: target.hostname, port });
 
-  const started = Date.now();
-  recordLog({ kind: 'ws', method: 'UPGRADE', target: target.href });
-
   upstream.once(secure ? 'secureConnect' : 'connect', () => {
+    upstream.setNoDelay(true);
+    upstream.setKeepAlive(true, 30000);
     const lines = [`${req.method} ${target.pathname}${target.search} HTTP/${req.httpVersion}`];
+    let hasOrigin = false;
     for (const [name, value] of Object.entries(req.headers)) {
       const lower = name.toLowerCase();
-      if (lower === 'host') lines.push(`Host: ${target.host}`);
-      else if (lower !== 'cookie' && value) lines.push(`${name}: ${Array.isArray(value) ? value.join(', ') : value}`);
+      if (lower === 'host') { lines.push(`Host: ${target.host}`); continue; }
+      if (lower === 'origin') { hasOrigin = true; lines.push(`Origin: ${originOverride || target.origin.replace(/^wss?:/i, 'https:')}`); continue; }
+      if (lower === 'cookie') {
+        const c = String(value).split(';').map(x => x.trim()).filter(x => x && !x.startsWith(COOKIE_NAME + '=')).join('; ');
+        if (c) lines.push(`Cookie: ${c}`);
+        continue;
+      }
+      if (lower === 'referer') continue;
+      if (value) lines.push(`${name}: ${Array.isArray(value) ? value.join(', ') : value}`);
     }
+    if (!hasOrigin && originOverride) lines.push(`Origin: ${originOverride}`);
     upstream.write(`${lines.join('\r\n')}\r\n\r\n`);
-    if (head && head.length) upstream.write(head);
+    if (head?.length) upstream.write(head);
     client.pipe(upstream);
   });
 
-  let responseBuffer = Buffer.alloc(0);
-  const onUpstreamData = (chunk) => {
-    responseBuffer = Buffer.concat([responseBuffer, chunk]);
-    const end = responseBuffer.indexOf('\r\n\r\n');
+  let buf = Buffer.alloc(0);
+  const onData = (chunk) => {
+    buf = Buffer.concat([buf, chunk]);
+    const end = buf.indexOf('\r\n\r\n');
     if (end < 0) return;
-    const statusLine = responseBuffer.slice(0, responseBuffer.indexOf('\r\n')).toString();
-    recordLog({ kind: 'ws-open', target: target.href, status: statusLine, ms: Date.now() - started });
-    client.write(responseBuffer);
-    upstream.removeListener('data', onUpstreamData);
+    const handshake = buf.subarray(0, end + 4).toString('latin1');
+    if (!/^HTTP\/1\.[01] 101\b/m.test(handshake)) {
+      client.write(buf);
+      client.end();
+      upstream.destroy();
+      return;
+    }
+    client.write(buf);
+    upstream.removeListener('data', onData);
+
+    // Match IP capture: sniff party socket traffic
+    if (target.hostname.startsWith('party.') || target.hostname.includes('.party.') || target.hostname.startsWith('ip_')) {
+      const needle = Buffer.from([0xa2, 0x69, 0x70, 0xd9, 0x20]);
+      let tail = Buffer.alloc(0);
+      upstream.on('data', (c) => {
+        const comb = Buffer.concat([tail, c]);
+        let idx = 0;
+        while ((idx = comb.indexOf(needle, idx)) !== -1) {
+          const hex = comb.slice(idx + needle.length, idx + needle.length + 32).toString('ascii');
+          if (/^[0-9a-f]{32}$/.test(hex) && originOverride) {
+            lastMatchIpByTarget.set(`${sid}:${originOverride}`, hex);
+            console.log(`[proxy] match ip captured ${hex.slice(0, 8)}... sid=${sid.slice(0, 8)}`);
+          }
+          idx += needle.length;
+        }
+        tail = comb.slice(-80);
+      });
+    }
+
     upstream.pipe(client);
   };
-  upstream.on('data', onUpstreamData);
-  upstream.on('error', (e) => { recordLog({ kind: 'ws-error', target: target.href, error: e.message }); client.destroy(); });
+  upstream.on('data', onData);
+  upstream.on('error', () => client.destroy());
   client.on('error', () => upstream.destroy());
 }
 
-// ---------- HTTP server ----------
+function decrementWs(key) {
+  wsCountByKey.set(key, Math.max(0, (wsCountByKey.get(key) || 1) - 1));
+}
 
+// ---------- HTTP server ----------
 const server = http.createServer({ timeout: 0 }, async (req, res) => {
   if (req.method === 'OPTIONS') {
     res.writeHead(204, {
-      'Access-Control-Allow-Origin': '*',
+      'Access-Control-Allow-Origin': req.headers.origin || '*',
       'Access-Control-Allow-Credentials': 'true',
-      'Access-Control-Allow-Headers': '*',
       'Access-Control-Allow-Methods': '*',
+      'Access-Control-Allow-Headers': req.headers['access-control-request-headers'] || '*',
     });
     return res.end();
   }
-
-  let local;
-  try { local = new URL(req.url, `http://${HOST}:${PORT}`); }
-  catch { return res.writeHead(400).end(); }
-
-  if (local.pathname === '/favicon.ico') return res.writeHead(204).end();
   if (!checkAuth(req, res)) return;
 
-  // ---- Log ingestion ----
-  if (req.method === 'POST' && local.pathname === '/__log') {
-    let body = '';
-    try {
-      for await (const chunk of req) {
-        body += chunk.toString('utf8');
-        if (body.length > 500_000) break;
-      }
-      const arr = JSON.parse(body);
-      if (Array.isArray(arr)) {
-        for (const e of arr) {
-          const { level, msg, page, t, ...extra } = e || {};
-          recordLog({ kind: 'client', level, msg, page, clientT: t, extra });
-        }
-      }
-    } catch (e) {
-      recordLog({ kind: 'client-error', error: e.message });
-    }
-    res.writeHead(204).end();
-    return;
-  }
+  let local;
+  try { local = new URL(req.url, `http://${HOST}:${PORT}`); } catch { return res.writeHead(400).end(); }
 
-  // ---- Log retrieval ----
-  if (req.method === 'GET' && local.pathname === '/__logs') {
-    const after = Number(local.searchParams.get('after') || 0);
-    const fmt = local.searchParams.get('format') || 'json';
-    const items = recentLogs.filter(e => e.id > after);
-    if (fmt === 'txt') {
-      res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8', 'Cache-Control': 'no-store' });
-      return res.end(items.map(e => JSON.stringify(e)).join('\n') + '\n');
-    }
-    res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' });
-    return res.end(JSON.stringify(items));
-  }
+  if (local.pathname === '/favicon.ico') return res.writeHead(204).end();
 
-  // ---- Proxied ----
   if (local.pathname.startsWith('/p/')) {
     let target;
     try {
-      const match = local.pathname.match(/^\/p\/([A-Za-z0-9_-]+)(\/.*)?$/);
-      if (!match) throw new Error('Invalid path');
-      target = decodeTarget(match[1]);
-      if (match[2] && match[2] !== '/') { target.pathname = match[2]; target.search = local.search; }
+      const m = local.pathname.match(/^\/p\/([A-Za-z0-9_-]+)(\/.*)?$/);
+      if (!m) throw new Error('bad path');
+      target = decodeTarget(m[1]);
+      if (m[2] && m[2] !== '/') { target.pathname = m[2]; target.search = local.search; }
       else if (local.search) target.search = local.search;
-      else if (match[2] === '/') target.pathname = '/';
-    } catch (e) {
-      recordLog({ kind: 'server-error', path: local.pathname, error: e.message });
-      return res.writeHead(400).end(e.message);
-    }
-    return proxyRequest(req, res, target);
-  }
-
-  // ---- Launcher ----
-  if (req.method === 'GET' && local.pathname === '/') {
-    let page;
-    try { page = fs.readFileSync(PAGE_PATH, 'utf8'); }
-    catch { return res.writeHead(500).end('index.html missing'); }
-    page = page.replaceAll('__PROXY_PORT__', String(PORT));
-    res.writeHead(200, {
-      'Content-Type': 'text/html; charset=utf-8',
-      'Cache-Control': 'no-store',
-      'Cross-Origin-Opener-Policy': 'same-origin',
-      'Cross-Origin-Embedder-Policy': 'credentialless',
+      else if (m[2] === '/') target.pathname = '/';
+    } catch (e) { return res.writeHead(400).end(e.message); }
+    return proxyRequest(req, res, target).catch((e) => {
+      if (!res.headersSent) res.writeHead(502, { 'Content-Type': 'text/plain' });
+      res.end('Upstream failed: ' + e.message);
     });
-    return res.end(page);
   }
 
-  return res.writeHead(404).end('Not found');
+  if (req.method === 'GET' && local.pathname === '/') {
+    try {
+      const page = fs.readFileSync(PAGE_PATH, 'utf8');
+      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' });
+      return res.end(page);
+    } catch { return res.writeHead(500).end('index.html missing'); }
+  }
+
+  res.writeHead(404).end('Not found');
 });
 
 server.on('upgrade', async (req, client, head) => {
   if (!isAuthed(req)) {
-    client.write('HTTP/1.1 401 Unauthorized\r\n\r\n');
+    client.write('HTTP/1.1 401 Unauthorized\r\nConnection: close\r\n\r\n');
     return client.destroy();
   }
-  let local;
-  try { local = new URL(req.url, `http://${HOST}:${PORT}`); }
-  catch { return client.destroy(); }
+  const sid = sessionId(req);
+  const key = `proxy:${sid}`;
+  if ((wsCountByKey.get(key) || 0) >= MAX_WS_PER_SESSION) {
+    client.write('HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\n\r\n');
+    return client.destroy();
+  }
 
-  let target;
+  let local;
+  try { local = new URL(req.url, `http://${HOST}:${PORT}`); } catch { return client.destroy(); }
+
+  let target, originOverride;
   try {
-    const match = local.pathname.match(/^\/_ws\/([A-Za-z0-9_-]+)(\/.*)?$/);
-    if (!match) throw new Error('Invalid WS path');
-    target = decodeTarget(match[1]);
-    target.protocol = target.protocol === 'https:' ? 'wss:' : 'ws:';
-    if (match[2]) target.pathname = match[2];
-    if (local.search) target.search = local.search;
-    await validatePublicTarget(target);
+    const explicit = local.pathname.match(/^\/_ws\/([A-Za-z0-9_-]+)(\/.*)?$/);
+    if (explicit) {
+      target = decodeTarget(explicit[1]);
+      if (explicit[2]) target.pathname = explicit[2];
+      if (local.search) target.search = local.search;
+      target.protocol = target.protocol === 'https:' ? 'wss:' : 'ws:';
+      const o = local.searchParams.get('o');
+      if (o) try { originOverride = Buffer.from(o, 'base64url').toString('utf8'); } catch {}
+      await validatePublicTarget(target);
+    } else {
+      // Relative /ws upgrade. Find the target via Referer.
+      let pageTarget = null;
+      const ref = req.headers.referer;
+      if (ref) {
+        try {
+          const r = new URL(ref);
+          const m = r.pathname.match(/^\/p\/([A-Za-z0-9_-]+)/);
+          if (m) pageTarget = decodeTarget(m[1]);
+        } catch {}
+      }
+      if (!pageTarget) {
+        const host = String(req.headers.host || '').split(':')[0];
+        const fallback = proxyHostTargets.get(host);
+        if (fallback) pageTarget = new URL(fallback);
+      }
+      if (!pageTarget) throw new Error('No target for WS upgrade.');
+
+      const matchKey = `${sid}:${pageTarget.origin}`;
+      const matchIp = lastMatchIpByTarget.get(matchKey);
+      const wsHost = matchIp
+        ? `ip_${matchIp}.party.${pageTarget.hostname}`
+        : `party.${pageTarget.hostname}`;
+      const search = local.search && !local.searchParams.has('__k') ? local.search : '';
+      target = new URL(`wss://${wsHost}${local.pathname}${search}`);
+      originOverride = pageTarget.origin;
+      await validatePublicTarget(target);
+    }
   } catch (e) {
-    recordLog({ kind: 'ws-error', path: local.pathname, error: e.message });
-    client.write('HTTP/1.1 400 Bad Request\r\n\r\n');
+    console.log(`[ws] rejected: ${e.message} sid=${sid.slice(0, 8)}`);
+    client.write('HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n');
     return client.destroy();
   }
-  await relayUpgrade(req, client, head, target);
+
+  wsCountByKey.set(key, (wsCountByKey.get(key) || 0) + 1);
+  let released = false;
+  const release = () => { if (!released) { released = true; decrementWs(key); } };
+  client.once('close', release);
+
+  await relayUpgrade(req, client, head, target, originOverride, sid);
 });
 
 server.listen(PORT, BIND_ADDRESS, () => {
   console.log(`Proxy listening on ${BIND_ADDRESS}:${PORT}`);
-  if (!VALID_KEYS.size) console.warn('⚠️  No valid keys — every request will be rejected. Fix users.json.');
+  if (!VALID_KEYS.size) console.warn('No valid keys — every request will 401. Fix users.json.');
 });

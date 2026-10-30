@@ -3,7 +3,6 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <meta name="referrer" content="no-referrer">
   <title>Website Viewer</title>
   <style>
     :root { color-scheme: dark; font: 14px/1.4 system-ui, sans-serif; background: #0d1118; color: #eef2f8; }
@@ -11,32 +10,24 @@
     #toolbar { display: flex; align-items: center; gap: 8px; padding: 8px 10px; background: #171d28; border-bottom: 1px solid #2a3444; }
     #address-form { flex: 1 1 auto; display: flex; min-width: 0; margin: 0; }
     #address { width: 100%; min-width: 0; padding: 8px 14px; color: inherit; background: #0b1017; border: 1px solid #2f3a4c; border-radius: 999px; font: inherit; }
-    #address:focus { outline: none; border-color: #5b8fd6; }
     .tool { flex: 0 0 auto; padding: 8px 10px; color: #c3cddc; background: transparent; border: 1px solid transparent; border-radius: 8px; font: inherit; cursor: pointer; }
     .tool:hover { background: #232c3b; border-color: #2f3a4c; }
-    #stage { position: relative; flex: 1 1 auto; min-height: 0; display: flex; background: #05070a; }
-    #viewer { display: block; flex: 1 1 auto; width: 100%; height: 100%; border: 0; background: #0b0f16; }
-    #log-panel { display: flex; flex-direction: column; height: 40vh; background: #0b1017; border-top: 1px solid #2a3444; }
-    #log-panel[hidden] { display: none; }
-    #log-pre { flex: 1 1 auto; overflow: auto; margin: 0; padding: 8px 10px; font: 12px/1.4 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; color: #b9c5d4; white-space: pre-wrap; word-break: break-all; }
+    #stage { flex: 1 1 auto; min-height: 0; display: flex; background: #05070a; }
+    #viewer { flex: 1 1 auto; width: 100%; height: 100%; border: 0; background: #0b0f16; }
   </style>
 </head>
 <body>
   <header id="toolbar">
     <form id="address-form" autocomplete="off" onsubmit="event.preventDefault(); document.getElementById('launch-btn').click();">
-      <input id="address" name="address" type="text" inputmode="url" placeholder="Enter a website address (e.g., deadshot.io)" aria-label="Website address" autocomplete="off" spellcheck="false" value="deadshot.io">
+      <input id="address" name="address" type="text" inputmode="url" placeholder="deadshot.io" aria-label="Website address" autocomplete="off" spellcheck="false" value="deadshot.io">
     </form>
     <button id="launch-btn" class="tool" type="button">Launch</button>
-    <button id="logs-btn" class="tool" type="button">Logs</button>
   </header>
   <main id="stage">
     <iframe id="viewer" title="Website view"
       allow="autoplay; fullscreen; gamepad; clipboard-read; clipboard-write; identity-credentials-get"
-      referrerpolicy="no-referrer"></iframe>
+      referrerpolicy="same-origin"></iframe>
   </main>
-  <div id="log-panel" hidden>
-    <pre id="log-pre"></pre>
-  </div>
   <script>
     const address = document.querySelector('#address');
     const viewer = document.querySelector('#viewer');
@@ -47,7 +38,6 @@
       for (const byte of bytes) binary += String.fromCharCode(byte);
       return btoa(binary).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/g, '');
     }
-
     function proxyUrl(target) {
       return `/p/${toBase64Url(target.href)}${target.pathname}${target.search}`;
     }
@@ -56,43 +46,8 @@
       let val = address.value.trim();
       if (!val) return;
       if (!val.startsWith('http')) val = 'https://' + val;
-      try {
-        const target = new URL(val);
-        viewer.src = proxyUrl(target);
-      } catch { alert('Invalid URL'); }
-    });
-
-    // ---- log panel ----
-    let lastLogId = 0;
-    let logTimer = null;
-
-    function pollLogs() {
-      fetch('/__logs?after=' + lastLogId, { credentials: 'same-origin' })
-        .then(r => r.ok ? r.json() : [])
-        .then(items => {
-          if (!items.length) return;
-          const pre = document.getElementById('log-pre');
-          const atBottom = pre.scrollTop + pre.clientHeight >= pre.scrollHeight - 10;
-          for (const e of items) {
-            lastLogId = Math.max(lastLogId, e.id);
-            pre.textContent += JSON.stringify(e) + '\n';
-          }
-          if (atBottom) pre.scrollTop = pre.scrollHeight;
-        })
-        .catch(() => {});
-    }
-
-    document.querySelector('#logs-btn').addEventListener('click', () => {
-      const panel = document.getElementById('log-panel');
-      if (panel.hidden) {
-        panel.hidden = false;
-        pollLogs();
-        logTimer = setInterval(pollLogs, 1500);
-      } else {
-        panel.hidden = true;
-        clearInterval(logTimer);
-        logTimer = null;
-      }
+      try { viewer.src = proxyUrl(new URL(val)); }
+      catch { alert('Invalid URL'); }
     });
 
     document.querySelector('#launch-btn').click();
