@@ -222,6 +222,10 @@ function rewriteHtml(html, target) {
     window.fetch = async function(input, init){
       var request = input instanceof Request ? input : new Request(input, init);
       var proxified = proxify(request.url);
+    window.fetch = async function(input, init){
+      var request = input instanceof Request ? input : new Request(input, init);
+      var proxified = proxify(request.url);
+      console.log('[proxy-fetch]', request.method, request.url, '->', proxified);
       var opts = {
         method: request.method, headers: request.headers,
         mode: request.mode === 'navigate' ? 'cors' : request.mode,
