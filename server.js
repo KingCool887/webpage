@@ -5,6 +5,7 @@ const fs = require('node:fs');
 const path = require('node:path');
 const net = require('node:net');
 const tls = require('node:tls');
+const zlib = require('node:zlib');
 const { lookup } = require('node:dns/promises');
 const { Readable } = require('node:stream');
 
@@ -15,7 +16,11 @@ const MAX_REQUEST_BYTES = 32 * 1024 * 1024;
 const PAGE_PATH = path.join(__dirname, 'index.html');
 const USERS_PATH = path.join(__dirname, 'users.json');
 const COOKIE_NAME = '__proxy_access';
-const LOG_LIMIT = 2000;
+const LOG_LIMIT = 3000;
+
+// Bodies sent to these hosts get captured (up to 8 KB) so we can see what the
+// game reports when it says "couldn't load game".
+const BODY_CAPTURE_HOST = /error|report|crash|sentry|bugsnag|rollbar|telemetry/i;
 
 // ---------- Logging ----------
 
@@ -27,7 +32,6 @@ function recordLog(entry) {
   entry.ts = new Date().toISOString();
   recentLogs.push(entry);
   if (recentLogs.length > LOG_LIMIT) recentLogs.shift();
-  // Echo to stdout so Render's dashboard shows it.
   try {
     if (entry.kind === 'client') {
       console.log(`[client:${entry.level || 'info'}] ${entry.msg || ''} ${entry.extra ? JSON.stringify(entry.extra) : ''}`);
@@ -47,7 +51,6 @@ try {
   console.log(`Loaded ${VALID_KEYS.size} active key(s) from users.json`);
 } catch (e) {
   console.error('Failed to load users.json:', e.message);
-  console.error('Server will start, but every request will be rejected until users.json is fixed.');
 }
 
 function keyFromCookie(header) {
@@ -172,17 +175,11 @@ function rewriteHtml(html, target) {
       if (!logBuffer.length) return;
       var payload = JSON.stringify(logBuffer.splice(0, logBuffer.length));
       try {
-        if (useBeacon && NATIVE_BEACON) {
-          NATIVE_BEACON(LOG_ENDPOINT, payload);
-        } else {
-          NATIVE_FETCH(LOG_ENDPOINT, {
-            method: 'POST',
-            headers: { 'content-type': 'application/json' },
-            credentials: 'include',
-            body: payload,
-            keepalive: true
-          }).catch(function(){});
-        }
+        if (useBeacon && NATIVE_BEACON) NATIVE_BEACON(LOG_ENDPOINT, payload);
+        else NATIVE_FETCH(LOG_ENDPOINT, {
+          method: 'POST', headers: { 'content-type': 'application/json' },
+          credentials: 'include', body: payload, keepalive: true
+        }).catch(function(){});
       } catch (e) {}
     }
 
@@ -201,8 +198,7 @@ function rewriteHtml(html, target) {
     window.addEventListener('error', function(e){
       try {
         if (e && e.target && e.target !== window && e.target.tagName) {
-          var src = e.target.src || e.target.href || '';
-          plog('error', 'resource-fail', { tag: e.target.tagName, src: String(src) });
+          plog('error', 'resource-fail', { tag: e.target.tagName, src: String(e.target.src || e.target.href || '') });
         } else {
           plog('error', 'script-error', {
             message: e && e.message, filename: e && e.filename,
@@ -216,12 +212,33 @@ function rewriteHtml(html, target) {
     window.addEventListener('unhandledrejection', function(e){
       try {
         var r = e && e.reason;
-        plog('error', 'unhandled-rejection', {
-          message: r && (r.message || String(r)),
-          stack: r && r.stack
-        });
+        plog('error', 'unhandled-rejection', { message: r && (r.message || String(r)), stack: r && r.stack });
       } catch (x) {}
     });
+
+    // ---- capability snapshot (once, at startup) ----
+    (function reportCaps(){
+      try {
+        var caps = {
+          crossOriginIsolated: window.crossOriginIsolated === true,
+          sharedArrayBuffer: typeof SharedArrayBuffer !== 'undefined',
+          atomics: typeof Atomics !== 'undefined',
+          wasm: typeof WebAssembly === 'object' && typeof WebAssembly.instantiate === 'function',
+          baseURI: document.baseURI,
+          href: location.href,
+          origin: location.origin,
+          hostname: location.hostname,
+          top: window === window.top,
+          inIframe: window.top !== window.self
+        };
+        try {
+          var c = document.createElement('canvas');
+          caps.webgl2 = !!c.getContext('webgl2');
+          caps.webgl = !!(c.getContext('webgl') || c.getContext('experimental-webgl'));
+        } catch (e) { caps.webglErr = e.message; }
+        plog('info', 'capabilities', caps);
+      } catch (e) { plog('error', 'capability check failed', { message: e.message }); }
+    })();
 
     // ---- URL proxify ----
     function encode(value) {
@@ -259,14 +276,10 @@ function rewriteHtml(html, target) {
       }
       return bodyPromise.then(function(bodyBuf){
         var opts = {
-          method: method,
-          headers: request.headers,
+          method: method, headers: request.headers,
           mode: request.mode === 'navigate' ? 'cors' : (request.mode || 'cors'),
-          credentials: 'include',
-          cache: request.cache,
-          redirect: request.redirect,
-          integrity: request.integrity,
-          signal: request.signal
+          credentials: 'include', cache: request.cache, redirect: request.redirect,
+          integrity: request.integrity, signal: request.signal
         };
         if (bodyBuf) opts.body = bodyBuf;
         return NATIVE_FETCH(proxified, opts).then(function(resp){
@@ -306,21 +319,14 @@ function rewriteHtml(html, target) {
     window.WebSocket = function(url, protocols) {
       var newUrl = String(url);
       try {
-        if (newUrl.indexOf('/_ws/') === 0) {
-          plog('info', 'WS passthrough ' + newUrl);
-          return new NativeWebSocket(newUrl, protocols);
-        }
+        if (newUrl.indexOf('/_ws/') === 0) return new NativeWebSocket(newUrl, protocols);
         var wsProto = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
         var resolved;
-        if (newUrl.indexOf('ws://') === 0 || newUrl.indexOf('wss://') === 0) {
-          resolved = new URL(newUrl);
-        } else if (newUrl.indexOf('//') === 0) {
-          resolved = new URL(wsProto + newUrl);
-        } else if (newUrl.charAt(0) === '/') {
-          resolved = new URL(wsProto + '//party.' + TARGET_HOSTNAME + newUrl);
-        } else {
-          return new NativeWebSocket(newUrl, protocols);
-        }
+        if (newUrl.indexOf('ws://') === 0 || newUrl.indexOf('wss://') === 0) resolved = new URL(newUrl);
+        else if (newUrl.indexOf('//') === 0) resolved = new URL(wsProto + newUrl);
+        else if (newUrl.charAt(0) === '/') resolved = new URL(wsProto + '//party.' + TARGET_HOSTNAME + newUrl);
+        else return new NativeWebSocket(newUrl, protocols);
+
         var finalUrl;
         if (resolved.hostname === window.location.hostname) {
           finalUrl = wsProto + '//party.' + TARGET_HOSTNAME + resolved.pathname + resolved.search;
@@ -329,9 +335,7 @@ function rewriteHtml(html, target) {
         }
         newUrl = wsProto + '//' + window.location.host + '/_ws/' + encode(finalUrl);
         plog('info', 'WS ' + url + ' -> ' + newUrl);
-      } catch (e) {
-        plog('error', 'WS rewrite failed for ' + url + ': ' + (e && e.message));
-      }
+      } catch (e) { plog('error', 'WS rewrite failed for ' + url + ': ' + (e && e.message)); }
       var sock = new NativeWebSocket(newUrl, protocols);
       sock.addEventListener('open', function(){ plog('info', 'WS open ' + newUrl); });
       sock.addEventListener('error', function(){ plog('error', 'WS error ' + newUrl); });
@@ -344,27 +348,31 @@ function rewriteHtml(html, target) {
     window.WebSocket.CLOSING = NativeWebSocket.CLOSING;
     window.WebSocket.CLOSED = NativeWebSocket.CLOSED;
 
-    // ---- sendBeacon (Cloudflare RUM etc.) ----
+    // ---- sendBeacon ----
     if (NATIVE_BEACON) {
       navigator.sendBeacon = function(url, data) {
         try {
           var p = proxify(String(url));
-          if (p.indexOf('/__') !== 0) {
-            plog('info', 'beacon ' + url + ' -> ' + p);
-          }
+          if (p.indexOf('/__') !== 0) plog('info', 'beacon ' + url + ' -> ' + p);
           return NATIVE_BEACON(p, data);
-        } catch (e) {
-          return NATIVE_BEACON(url, data);
-        }
+        } catch (e) { return NATIVE_BEACON(url, data); }
       };
     }
 
-    // ---- Worker (log only — not rewritten) ----
+    // ---- Worker (with error listener) ----
     if (window.Worker) {
       var NativeWorker = window.Worker;
       window.Worker = function(url, opts) {
-        plog('info', 'Worker ' + url);
-        return new NativeWorker(url, opts);
+        plog('info', 'Worker create ' + url);
+        var w;
+        try { w = new NativeWorker(url, opts); }
+        catch (e) { plog('error', 'Worker construct failed ' + url + ': ' + (e && e.message)); throw e; }
+        w.addEventListener('error', function(ev){
+          plog('error', 'Worker error ' + url, {
+            message: ev && ev.message, filename: ev && ev.filename, lineno: ev && ev.lineno
+          });
+        });
+        return w;
       };
       window.Worker.prototype = NativeWorker.prototype;
     }
@@ -399,8 +407,7 @@ function rewriteHtml(html, target) {
       var d = Object.getOwnPropertyDescriptor(proto, prop);
       if (!d || !d.get || !d.set || !d.configurable) return;
       Object.defineProperty(proto, prop, {
-        configurable: true,
-        enumerable: d.enumerable,
+        configurable: true, enumerable: d.enumerable,
         get: function(){ return d.get.call(this); },
         set: function(v){ d.set.call(this, typeof v === 'string' ? proxify(v) : v); }
       });
@@ -437,9 +444,29 @@ function rewriteSetCookie(header) {
   return header.replace(/;\s*domain=[^;]*/gi, '');
 }
 
+function maybeLogErrorReport(target, req, body) {
+  if (!body || body.length > 50_000) return;
+  if (!BODY_CAPTURE_HOST.test(target.hostname)) return;
+  let text = '';
+  const enc = String(req.headers['content-encoding'] || '').toLowerCase();
+  try {
+    if (enc === 'gzip') text = zlib.gunzipSync(body).toString('utf8');
+    else if (enc === 'deflate') text = zlib.inflateSync(body).toString('utf8');
+    else if (enc === 'br') text = zlib.brotliDecompressSync(body).toString('utf8');
+    else text = body.toString('utf8');
+  } catch (e) { text = '<decode failed: ' + e.message + '>'; }
+  recordLog({
+    kind: 'error-report',
+    target: target.href,
+    ctype: req.headers['content-type'] || '',
+    encoding: enc || null,
+    len: body.length,
+    body: text.slice(0, 8000),
+  });
+}
+
 async function proxyRequest(req, res, target) {
   const started = Date.now();
-
   res.on('finish', () => {
     recordLog({
       kind: 'server',
@@ -451,9 +478,8 @@ async function proxyRequest(req, res, target) {
     });
   });
 
-  try {
-    await validatePublicTarget(target);
-  } catch (e) {
+  try { await validatePublicTarget(target); }
+  catch (e) {
     recordLog({ kind: 'server-error', target: target.href, error: 'validatePublicTarget: ' + e.message });
     res.writeHead(502, { 'Content-Type': 'text/plain; charset=utf-8' });
     return res.end('Upstream blocked: ' + e.message);
@@ -473,11 +499,11 @@ async function proxyRequest(req, res, target) {
   if (req.headers.origin) headers.set('origin', target.origin);
 
   const body = ['GET', 'HEAD'].includes(req.method) ? undefined : await readRequestBody(req);
+  if (body) maybeLogErrorReport(target, req, body);
 
   let upstream;
-  try {
-    upstream = await fetch(target, { method: req.method, headers, body, redirect: 'manual' });
-  } catch (e) {
+  try { upstream = await fetch(target, { method: req.method, headers, body, redirect: 'manual' }); }
+  catch (e) {
     recordLog({ kind: 'server-error', target: target.href, error: 'fetch upstream: ' + e.message });
     res.writeHead(502, { 'Content-Type': 'text/plain; charset=utf-8' });
     return res.end('Upstream fetch failed: ' + e.message);
@@ -490,9 +516,7 @@ async function proxyRequest(req, res, target) {
   }
 
   if (typeof upstream.headers.getSetCookie === 'function') {
-    for (const c of upstream.headers.getSetCookie()) {
-      outHeaders.append('set-cookie', rewriteSetCookie(c));
-    }
+    for (const c of upstream.headers.getSetCookie()) outHeaders.append('set-cookie', rewriteSetCookie(c));
   } else {
     const single = upstream.headers.get('set-cookie');
     if (single) outHeaders.set('set-cookie', rewriteSetCookie(single));
@@ -571,10 +595,7 @@ async function relayUpgrade(req, client, head, target) {
     upstream.pipe(client);
   };
   upstream.on('data', onUpstreamData);
-  upstream.on('error', (e) => {
-    recordLog({ kind: 'ws-error', target: target.href, error: e.message });
-    client.destroy();
-  });
+  upstream.on('error', (e) => { recordLog({ kind: 'ws-error', target: target.href, error: e.message }); client.destroy(); });
   client.on('error', () => upstream.destroy());
 }
 
@@ -595,9 +616,7 @@ const server = http.createServer({ timeout: 0 }, async (req, res) => {
   try { local = new URL(req.url, `http://${HOST}:${PORT}`); }
   catch { return res.writeHead(400).end(); }
 
-  // Kill favicon noise.
   if (local.pathname === '/favicon.ico') return res.writeHead(204).end();
-
   if (!checkAuth(req, res)) return;
 
   // ---- Log ingestion ----
@@ -658,7 +677,12 @@ const server = http.createServer({ timeout: 0 }, async (req, res) => {
     try { page = fs.readFileSync(PAGE_PATH, 'utf8'); }
     catch { return res.writeHead(500).end('index.html missing'); }
     page = page.replaceAll('__PROXY_PORT__', String(PORT));
-    res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' });
+    res.writeHead(200, {
+      'Content-Type': 'text/html; charset=utf-8',
+      'Cache-Control': 'no-store',
+      'Cross-Origin-Opener-Policy': 'same-origin',
+      'Cross-Origin-Embedder-Policy': 'credentialless',
+    });
     return res.end(page);
   }
 
@@ -693,7 +717,5 @@ server.on('upgrade', async (req, client, head) => {
 
 server.listen(PORT, BIND_ADDRESS, () => {
   console.log(`Proxy listening on ${BIND_ADDRESS}:${PORT}`);
-  if (!VALID_KEYS.size) {
-    console.warn('⚠️  No valid keys — every request will be rejected. Fix users.json.');
-  }
+  if (!VALID_KEYS.size) console.warn('⚠️  No valid keys — every request will be rejected. Fix users.json.');
 });
