@@ -231,6 +231,43 @@ function rewriteHtml(html, target) {
     patch(HTMLVideoElement.prototype, 'poster');
     patch(HTMLFormElement.prototype, 'action');
 
+    // WebSocket interception — the game connects directly to *.deadshot.io for
+    // party/match servers, which the browser blocks on Origin mismatch. We
+    // rewrite those URLs to our /_ws/ endpoint so the proxy can set the right
+    // Origin header and relay the connection.
+    var NativeWebSocket = window.WebSocket;
+    var TARGET_TLD = TARGET_HOSTNAME.split('.').slice(-2).join('.'); // e.g. 'deadshot.io'
+
+    function PatchedWebSocket(url, protocols) {
+      var newUrl = String(url);
+      try {
+        if (newUrl.indexOf('/_ws/') !== 0) {
+          var u = new URL(newUrl, TARGET_BASE);
+          if (u.hostname === TARGET_TLD || u.hostname.endsWith('.' + TARGET_TLD)) {
+            var wsScheme = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+            var upstream = 'https://' + u.host + u.pathname + u.search;
+            var encoded = encode(upstream);
+            newUrl = wsScheme + '//' + window.location.host + '/_ws/' + encoded + '?o=' + encode(TARGET_BASE);
+            console.log('[proxy] ws rewrite', url, '->', newUrl);
+          }
+        }
+      } catch (e) {}
+      return new NativeWebSocket(newUrl, protocols);
+    }
+
+    PatchedWebSocket.prototype = NativeWebSocket.prototype;
+    PatchedWebSocket.CONNECTING = 0;
+    PatchedWebSocket.OPEN = 1;
+    PatchedWebSocket.CLOSING = 2;
+    PatchedWebSocket.CLOSED = 3;
+    // These three make the patched constructor indistinguishable from native
+    // to a simple feature-detection check.
+    PatchedWebSocket.toString = NativeWebSocket.toString.bind(NativeWebSocket);
+    Object.defineProperty(PatchedWebSocket, 'name', { value: 'WebSocket', configurable: true });
+    Object.defineProperty(PatchedWebSocket.prototype, 'constructor', { value: PatchedWebSocket, configurable: true, writable: true });
+
+    window.WebSocket = PatchedWebSocket;
+
     // Global setAttribute — catches new Image().setAttribute('src', ...),
     // which bypasses the document.createElement patch because new Image()
     // doesn't route through createElement internally.
