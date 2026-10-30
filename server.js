@@ -149,6 +149,33 @@ function rewriteHtml(html, target) {
       } catch (e) { return value; }
     }
 
+    // WebSocket
+    var NATIVE_WS = window.WebSocket;
+    function proxifyWs(url){
+      if (typeof url !== 'string') url = String(url);
+      if (/^(data:|blob:|javascript:|mailto:|tel:|about:)/i.test(url)) return url;
+      try {
+        var u = new URL(url, TARGET_BASE);
+        var proto = u.protocol;
+        if (proto !== 'ws:' && proto !== 'wss:' && proto !== 'http:' && proto !== 'https:') return url;
+        if (u.pathname.indexOf('/_ws/') === 0) return url;
+        var host = u.hostname + (u.port ? ':' + u.port : '');
+        var originScheme = (proto === 'wss:' || proto === 'https:') ? 'https:' : 'http:';
+        var targetOrigin = originScheme + '//' + host;
+        var wsScheme = location.protocol === 'https:' ? 'wss:' : 'ws:';
+        return wsScheme + '//' + location.host + '/_ws/' + encode(targetOrigin) + u.pathname + u.search + '?o=' + encode(TARGET_BASE);
+      } catch (e) { return url; }
+    }
+    window.WebSocket = function WebSocket(url, protocols){
+      if (protocols === undefined) return new NATIVE_WS(proxifyWs(String(url)));
+      return new NATIVE_WS(proxifyWs(String(url)), protocols);
+    };
+    window.WebSocket.prototype = NATIVE_WS.prototype;
+    window.WebSocket.CONNECTING = NATIVE_WS.CONNECTING;
+    window.WebSocket.OPEN = NATIVE_WS.OPEN;
+    window.WebSocket.CLOSING = NATIVE_WS.CLOSING;
+    window.WebSocket.CLOSED = NATIVE_WS.CLOSED;
+
     // fetch
     window.fetch = async function(input, init){
       var request = input instanceof Request ? input : new Request(input, init);
@@ -537,6 +564,8 @@ server.on('upgrade', async (req, client, head) => {
       target.protocol = target.protocol === 'https:' ? 'wss:' : 'ws:';
       const o = local.searchParams.get('o');
       if (o) try { originOverride = Buffer.from(o, 'base64url').toString('utf8'); } catch {}
+      local.searchParams.delete('o');
+      target.search = local.searchParams.toString() ? '?' + local.searchParams.toString() : '';
       await validatePublicTarget(target);
       console.log(`[ws] explicit -> ${target.href} origin=${originOverride || '(none)'} sid=${sid.slice(0, 8)}`);
     } else {
