@@ -231,40 +231,7 @@ function rewriteHtml(html, target) {
     patch(HTMLVideoElement.prototype, 'poster');
     patch(HTMLFormElement.prototype, 'action');
 
-    // Target ONLY the match server: wss://ip_<hex>.deadshot.io/ws?...
-    // Leave party.deadshot.io alone — it works as a direct connection.
-    var NativeWebSocket = window.WebSocket;
 
-    function PatchedWebSocket(url, protocols) {
-      var newUrl = String(url);
-      try {
-        if (newUrl.indexOf('/_ws/') !== 0) {
-          var u = new URL(newUrl, TARGET_BASE);
-          var isMatch = u.hostname.indexOf('ip_') === 0 &&
-                        u.hostname.endsWith('.deadshot.io');
-          if (isMatch) {
-            var wsScheme = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-            var upstream = 'https://' + u.host + u.pathname + u.search;
-            var encoded = encode(upstream);
-            newUrl = wsScheme + '//' + window.location.host + '/_ws/' + encoded + '?o=' + encode(TARGET_BASE);
-            console.log('[proxy] match ws rewrite:', url, '->', newUrl);
-          }
-        }
-      } catch (e) {
-        console.log('[proxy] match ws rewrite failed:', e.message);
-      }
-      return new NativeWebSocket(newUrl, protocols);
-    }
-
-    PatchedWebSocket.prototype = NativeWebSocket.prototype;
-    PatchedWebSocket.CONNECTING = 0;
-    PatchedWebSocket.OPEN = 1;
-    PatchedWebSocket.CLOSING = 2;
-    PatchedWebSocket.CLOSED = 3;
-    PatchedWebSocket.toString = NativeWebSocket.toString.bind(NativeWebSocket);
-    Object.defineProperty(PatchedWebSocket, 'name', { value: 'WebSocket', configurable: true });
-    Object.defineProperty(PatchedWebSocket.prototype, 'constructor', { value: PatchedWebSocket, configurable: true, writable: true });
-    window.WebSocket = PatchedWebSocket;
 
     // Global setAttribute — catches new Image().setAttribute('src', ...),
     // which bypasses the document.createElement patch because new Image()
