@@ -238,7 +238,9 @@ function rewriteHtml(html, target) {
         return nativeReg.call(this, proxify(String(scriptURL)), opts);
       };
     }
-
+    
+    var imgDesc = Object.getOwnPropertyDescriptor(HTMLImageElement.prototype, 'src');
+console.log('[proxy] img.src descriptor:', imgDesc ? { hasGet: !!imgDesc.get, hasSet: !!imgDesc.set, configurable: imgDesc.configurable } : 'missing');
     console.log('[proxy] runtime installed target=' + TARGET_BASE);
   })();</script>`;
 
@@ -345,7 +347,7 @@ async function proxyRequest(req, res, target) {
   }
   if (/application\/json|text\/plain/i.test(ct)) {
     const text = await upstream.text();
-    // Rewrite any wss:// URL embedded in JSON (party server style) to /_ws/<token>?o=<origin>
+    console.log(`[json] ${target.hostname}${target.pathname.slice(0, 40)} (${text.length}B): ${text.slice(0, 300).replace(/\s+/g, ' ')}`);
     const originToken = Buffer.from(target.origin, 'utf8').toString('base64url');
     const wsScheme = (req.headers['x-forwarded-proto'] === 'https' || req.socket.encrypted) ? 'wss' : 'ws';
     const rewritten = text.replace(/(["'])wss?:\/\/[^"']+\1/gi, (match, q) => {
@@ -516,6 +518,7 @@ server.on('upgrade', async (req, client, head) => {
       const o = local.searchParams.get('o');
       if (o) try { originOverride = Buffer.from(o, 'base64url').toString('utf8'); } catch {}
       await validatePublicTarget(target);
+      console.log(`[ws] fallback -> ${target.href} origin=${originOverride} sid=${sid.slice(0, 8)}`);
     } else {
       // Relative /ws upgrade. Find the target via Referer.
       let pageTarget = null;
