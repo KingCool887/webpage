@@ -149,7 +149,7 @@ function rewriteHtml(html, target) {
       } catch (e) { return value; }
     }
 
-    // WebSocket
+    // WebSocket (Proxy-based; preserves toString and instanceof)
     var NATIVE_WS = window.WebSocket;
     function proxifyWs(url){
       if (typeof url !== 'string') url = String(url);
@@ -163,18 +163,20 @@ function rewriteHtml(html, target) {
         var originScheme = (proto === 'wss:' || proto === 'https:') ? 'https:' : 'http:';
         var targetOrigin = originScheme + '//' + host;
         var wsScheme = location.protocol === 'https:' ? 'wss:' : 'ws:';
-        return wsScheme + '//' + location.host + '/_ws/' + encode(targetOrigin) + u.pathname + u.search + '?o=' + encode(TARGET_BASE);
-      } catch (e) { return url; }
+        var result = wsScheme + '//' + location.host + '/_ws/' + encode(targetOrigin) + u.pathname + u.search + '?o=' + encode(TARGET_BASE);
+        console.log('[proxy-ws] ' + url + ' -> ' + result);
+        return result;
+      } catch (e) {
+        console.log('[proxy-ws] could not proxify ' + url + ': ' + e.message);
+        return url;
+      }
     }
-    window.WebSocket = function WebSocket(url, protocols){
-      if (protocols === undefined) return new NATIVE_WS(proxifyWs(String(url)));
-      return new NATIVE_WS(proxifyWs(String(url)), protocols);
-    };
-    window.WebSocket.prototype = NATIVE_WS.prototype;
-    window.WebSocket.CONNECTING = NATIVE_WS.CONNECTING;
-    window.WebSocket.OPEN = NATIVE_WS.OPEN;
-    window.WebSocket.CLOSING = NATIVE_WS.CLOSING;
-    window.WebSocket.CLOSED = NATIVE_WS.CLOSED;
+    window.WebSocket = new Proxy(NATIVE_WS, {
+      construct: function(target, args) {
+        if (args.length > 0) args[0] = proxifyWs(String(args[0]));
+        return Reflect.construct(target, args);
+      }
+    });
 
     // fetch
     window.fetch = async function(input, init){
