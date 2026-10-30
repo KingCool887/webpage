@@ -1,37 +1,37 @@
-# Shared website proxy
+## Debugging
 
-A single-process HTTP + WebSocket reverse proxy with a small launcher page in
-front of it. You run one Node process, open the launcher, type a site (default
-`deadshot.io`), and the site loads inside an iframe with its URLs rewritten so
-that every asset, fetch, XHR, and WebSocket request flows through the proxy.
+### Server logs
+Every proxied request (`/p/...`) and every WebSocket upgrade is appended to a
+ring buffer (2000 entries) with:
 
-It is intended for a small group of friends sharing a single deployment on
-Render's free tier. Access is gated by per-person keys in `users.json`.
+- method, **decoded target URL**, response status, elapsed ms, content-type
+- upstream fetch failures logged with the error message
 
-## How it works
+Also echoed to stdout, so they appear in Render's dashboard log viewer.
 
-- **Launcher page (`/`)** — a plain HTML page with an address bar and an iframe.
-  Once authenticated, it auto-launches the default site so returning users land
-  straight in the game.
-- **Proxy (`/p/<base64-target>/...`)** — fetches the target, rewrites HTML/CSS
-  URLs, strips frame-blocking headers, forwards cookies, and streams the body
-  back. Non-HTML responses pass through unchanged.
-- **WebSocket relay (`/_ws/<base64-target>/...`)** — tunnels WebSocket upgrades
-  to the target. The in-page runtime rewrites `new WebSocket(...)` calls so the
-  game's party server (e.g. `party.deadshot.io`) is reachable through the proxy.
-  Any WS URL that resolves to the proxy hostname — including relative `/ws`
-  paths — is redirected to `party.<target host>` per design.
-- **Runtime shim** — injected into every proxied HTML page. It patches `fetch`,
-  `XMLHttpRequest`, `WebSocket`, `document.createElement`, and URL properties
-  on `HTMLIFrameElement` / `HTMLScriptElement` / `HTMLImageElement` /
-  `HTMLLinkElement` / `HTMLMediaElement` so dynamically constructed URLs also go
-  through the proxy.
-- **Auth** — the launcher and every proxied request require an `access` cookie.
-  You get it by visiting the launcher once with `?key=<one-of-your-users>`.
+Endpoints (both require the auth cookie):
 
-## Auth
+- `GET /__logs` — JSON array of entries with a monotonic `id`
+- `GET /__logs?after=<id>` — only entries newer than `id`
+- `GET /__logs?format=txt` — plaintext, one JSON object per line
 
-`users.json` is the source of truth. Format:
+### Client logs
+The runtime shim injected into every proxied page patches:
 
-```json
-{ "keys": [ { "key": "Colin_4587", "name": "Colin", "active": true } ] }
+- `fetch`, `XMLHttpRequest`, `WebSocket`, `navigator.sendBeacon`
+- `document.createElement` for `script` / `link` / `img`
+- `Worker` (logged, not rewritten), `navigator.serviceWorker.register`
+- `window.onerror` (both script and resource errors) and `unhandledrejection`
+
+Each network call is logged with `method URL -> status (ms)` — including the
+original URL and the proxified URL for WebSockets. Entries are batched (25 at a
+time, or every 3s, or on `pagehide`) and POSTed to `/__log`, and mirrored to
+the browser console as `[proxy-log] ...`.
+
+### The Logs panel
+The launcher toolbar has a **Logs** button. Clicking it opens a panel at the
+bottom that polls `/__logs?after=<id>` every 1.5s and shows a merged stream of
+server and client entries. Leave it open while loading Deadshot and it will
+show exactly which request, WebSocket, or resource failed.
+
+For a raw text log: `GET /__logs?format=txt` in a new tab.
