@@ -166,11 +166,15 @@ try {
     var proxified = H.proxify(request.url);
     console.log('[proxy-fetch]', request.method, request.url, '->', proxified);
     var opts = {
-      method: request.method, headers: request.headers,
-      mode: request.mode === 'navigate' ? 'cors' : request.mode,
-      credentials: 'include',
-      cache: request.cache, redirect: request.redirect,
-      integrity: request.integrity, signal: request.signal
+      method: request.method,
+      headers: request.headers,
+      // Do NOT force 'include' or 'cors'. Let Unity use whatever it already asked for.
+      credentials: request.credentials,
+      mode: request.mode,
+      cache: request.cache,
+      redirect: request.redirect,
+      integrity: request.integrity,
+      signal: request.signal
     };
     if (request.body && request.method !== 'GET' && request.method !== 'HEAD') {
       opts.body = await request.clone().arrayBuffer();
@@ -266,7 +270,7 @@ try {
   }
   patch(HTMLIFrameElement.prototype, 'src');
   patch(HTMLScriptElement.prototype, 'src');
-  patch(HTMLImageElement.prototype, 'src');
+  //patch(HTMLImageElement.prototype, 'src');
   patch(HTMLLinkElement.prototype, 'href');
   patch(HTMLAnchorElement.prototype, 'href');
   patch(HTMLSourceElement.prototype, 'src');
