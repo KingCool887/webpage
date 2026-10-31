@@ -162,24 +162,26 @@ try {
   var NATIVE_FETCH = window.fetch.bind(window);
   var NATIVE_BEACON = navigator.sendBeacon ? navigator.sendBeacon.bind(navigator) : null;
 
-  window.fetch = async function(input, init){
+  window.fetch = async function(input, init) {
     var request = input instanceof Request ? input : new Request(input, init);
     var proxified = H.proxify(request.url);
-    console.log('[proxy-fetch]', request.method, request.url, '->', proxified);
     var opts = {
-      method: request.method,
-      headers: request.headers,
-      credentials: request.credentials,
-      mode: request.mode,
-      cache: request.cache,
-      redirect: request.redirect,
-      integrity: request.integrity,
-      signal: request.signal
+      method: request.method, headers: request.headers,
+      credentials: request.credentials, mode: request.mode,
+      cache: request.cache, redirect: request.redirect,
+      integrity: request.integrity, signal: request.signal
     };
     if (request.body && request.method !== 'GET' && request.method !== 'HEAD') {
       opts.body = await request.clone().arrayBuffer();
     }
-    return NATIVE_FETCH(proxified, opts);
+    try {
+      var res = await NATIVE_FETCH(proxified, opts);
+      console.log('[proxy-fetch-res]', request.url, '->', res.status);
+      return res;
+    } catch (e) {
+      console.error('[proxy-fetch-err]', request.url, e);
+      throw e;
+    }
   };
 
   var nativeOpen = XMLHttpRequest.prototype.open;
@@ -297,8 +299,23 @@ try {
     return nativeSetAttr.call(this, name, value);
   };
 
-  // Add back the image patch that was commented out
-  patch(HTMLImageElement.prototype, 'src');
+  var OriginalImage = window.Image;
+  window.Image = new Proxy(OriginalImage, {
+    construct: function(target, args) {
+      var img = new OriginalImage(...args);
+      var origSrc = Object.getOwnPropertyDescriptor(HTMLImageElement.prototype, 'src');
+      Object.defineProperty(img, 'src', {
+        set: function(val) {
+          if (typeof val === 'string') val = H.proxify(val);
+          origSrc.set.call(img, val);
+        },
+        get: function() {
+          return origSrc.get.call(img);
+        }
+      });
+      return img;
+    }
+  });
 
   // NEW: Catch dynamically injected CSS background-images
   var nativeSetProperty = CSSStyleDeclaration.prototype.setProperty;
@@ -462,7 +479,24 @@ async function proxyRequest(req, res, target) {
     res.writeHead(upstream.status, headerObj);
     return res.end(css);
   }
-   if (/application\/json/i.test(ct)) {
+  if (/application\/json/i.test(ct) || (ct.includes('text/plain') && target.hostname.includes('matchmaking'))) {
+    const text = await upstream.text();
+    if (text.includes('ws://') || text.includes('wss://') || text.includes('"')) {
+      const originToken = Buffer.from(target.origin, 'utf8').toString('base64url');
+      const wsScheme = (req.headers['x-forwarded-proto'] === 'https' || req.socket.encrypted) ? 'wss' : 'ws';
+      const rewritten = text.replace(/(["'])wss?:\/\/[^"']+\1/gi, (match, q) => {
+        const url = match.slice(1, -1);
+        const encoded = Buffer.from(url.replace(/^wss:\/\//i, 'https://').replace(/^ws:\/\//i, 'http://')).toString('base64url');
+        return `${q}${wsScheme}://${req.headers.host}/_ws/${encoded}?o=${originToken}${q}`;
+      });
+      headerObj['content-type'] = 'application/json; charset=utf-8';
+      res.writeHead(upstream.status, headerObj);
+      return res.end(rewritten);
+    }
+    headerObj['content-type'] = 'text/plain; charset=utf-8';
+    res.writeHead(upstream.status, headerObj);
+    return res.end(text);
+  }
     const text = await upstream.text();
     const originToken = Buffer.from(target.origin, 'utf8').toString('base64url');
     const wsScheme = (req.headers['x-forwarded-proto'] === 'https' || req.socket.encrypted) ? 'wss' : 'ws';
