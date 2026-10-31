@@ -311,7 +311,53 @@ try {
     return nativeSetProperty.call(this, prop, value, priority);
   };
 
-  console.log('[proxy-step-4] dom ok');
+
+  var observer = new MutationObserver(function(mutations) {
+    for (var i = 0; i < mutations.length; i++) {
+      var m = mutations[i];
+      if (m.type === 'attributes' && m.attributeName === 'src' && m.target.tagName === 'IMG') {
+        var src = m.target.getAttribute('src');
+        if (src && !src.startsWith('/p/') && !src.startsWith('data:')) {
+          m.target.setAttribute('src', H.proxify(src));
+        }
+      } else if (m.type === 'childList') {
+        m.addedNodes.forEach(function(node) {
+          if (node.tagName === 'IMG' && node.src) node.src = H.proxify(node.src);
+          if (node.querySelectorAll) {
+            var imgs = node.querySelectorAll('img');
+            for (var j = 0; j < imgs.length; j++) { imgs[j].src = H.proxify(imgs[j].src); }
+          }
+        });
+      }
+    }
+  });
+  observer.observe(document.documentElement, { childList: true, subtree: true, attributes: true, attributeFilter: ['src'] });
+
+  var nativeSetProperty = CSSStyleDeclaration.prototype.setProperty;
+  CSSStyleDeclaration.prototype.setProperty = function(prop, value, priority) {
+    if (prop === 'background-image' || prop === 'background') {
+      value = String(value).replace(/url\(['"]?([^'"]+)['"]?\)/gi, function(match, url) {
+        return 'url("' + H.proxify(url) + '")';
+      });
+    }
+    return nativeSetProperty.call(this, prop, value, priority);
+  };
+
+  ['backgroundImage', 'background'].forEach(function(prop) {
+    var d = Object.getOwnPropertyDescriptor(CSSStyleDeclaration.prototype, prop);
+    if (d && d.set) {
+      Object.defineProperty(CSSStyleDeclaration.prototype, prop, {
+        set: function(v) {
+          if (typeof v === 'string') {
+            v = v.replace(/url\(['"]?([^'"]+)['"]?\)/gi, function(match, url) {
+              return 'url("' + H.proxify(url) + '")';
+            });
+          }
+          d.set.call(this, v);
+        }
+      });
+    }
+  });
   console.log('[proxy-step-4] dom ok');
 } catch (e) { console.error('[proxy-step-4] FAILED:', e && e.message); }
 })();
@@ -379,7 +425,15 @@ async function proxyRequest(req, res, target) {
   const cookie = (req.headers.cookie || '').split(';').map(c => c.trim())
     .filter(c => c && !c.startsWith(COOKIE_NAME + '=')).join('; ');
   if (cookie) headers.set('cookie', cookie);
-  if (req.headers.origin) headers.set('origin', target.origin);
+  let pageOrigin = target.origin;
+  if (req.headers.referer) {
+    try {
+      const r = new URL(req.headers.referer);
+      const m = r.pathname.match(/^\/p\/([A-Za-z0-9_-]+)/);
+      if (m) pageOrigin = decodeTarget(m[1]).origin;
+    } catch {}
+  }
+  if (req.headers.origin) headers.set('origin', pageOrigin);
   if (req.headers.referer) {
     try {
       const r = new URL(req.headers.referer);
