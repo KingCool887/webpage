@@ -296,6 +296,22 @@ try {
     }
     return nativeSetAttr.call(this, name, value);
   };
+
+  // Add back the image patch that was commented out
+  patch(HTMLImageElement.prototype, 'src');
+
+  // NEW: Catch dynamically injected CSS background-images
+  var nativeSetProperty = CSSStyleDeclaration.prototype.setProperty;
+  CSSStyleDeclaration.prototype.setProperty = function(prop, value, priority) {
+    if (prop === 'background-image' || prop === 'background') {
+      value = String(value).replace(/url\(['"]?([^'"]+)['"]?\)/gi, function(match, url) {
+        return 'url("' + H.proxify(url) + '")';
+      });
+    }
+    return nativeSetProperty.call(this, prop, value, priority);
+  };
+
+  console.log('[proxy-step-4] dom ok');
   console.log('[proxy-step-4] dom ok');
 } catch (e) { console.error('[proxy-step-4] FAILED:', e && e.message); }
 })();
