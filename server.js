@@ -185,13 +185,14 @@ try {
   XMLHttpRequest.prototype.open = function(method, url){
     var args = Array.prototype.slice.call(arguments);
     args[1] = H.proxify(String(url));
+    console.log('[proxy-xhr]', method, url, '->', args[1]);
     return nativeOpen.apply(this, args);
   };
-  if (NATIVE_BEACON) {
-    navigator.sendBeacon = function(url, data){
-      try { return NATIVE_BEACON(H.proxify(String(url)), data); }
-      catch (e) { return NATIVE_BEACON(url, data); }
-    };
+  var nativeSend = XMLHttpRequest.prototype.send;
+  XMLHttpRequest.prototype.send = function(){
+    this.addEventListener('error', function(){ console.error('[proxy-xhr-error]', this.status, this.responseURL); });
+    return nativeSend.apply(this, arguments);
+  };
   }
   console.log('[proxy-step-2] network ok');
 } catch (e) { console.error('[proxy-step-2] FAILED:', e && e.message); }
@@ -222,12 +223,14 @@ try {
       return url;
     }
   }
+  /*
   window.WebSocket = new Proxy(NATIVE_WS, {
     construct: function(target, args) {
       if (args.length > 0 && args[0] != null) args[0] = proxifyWs(String(args[0]));
       return Reflect.construct(target, args);
     }
   });
+  */
   console.log('[proxy-step-3] ws ok');
 } catch (e) { console.error('[proxy-step-3] FAILED:', e && e.message); }
 })();
@@ -406,7 +409,7 @@ async function proxyRequest(req, res, target) {
     res.writeHead(upstream.status, headerObj);
     return res.end(css);
   }
-  if (/application\/json|text\/plain/i.test(ct)) {
+   if (/application\/json/i.test(ct)) {
     const text = await upstream.text();
     const originToken = Buffer.from(target.origin, 'utf8').toString('base64url');
     const wsScheme = (req.headers['x-forwarded-proto'] === 'https' || req.socket.encrypted) ? 'wss' : 'ws';
