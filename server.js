@@ -161,6 +161,7 @@ try {
   if (!H) { console.error('[proxy-step-2] helpers missing'); return; }
   var NATIVE_FETCH = window.fetch.bind(window);
   var NATIVE_BEACON = navigator.sendBeacon ? navigator.sendBeacon.bind(navigator) : null;
+
   window.fetch = async function(input, init){
     var request = input instanceof Request ? input : new Request(input, init);
     var proxified = H.proxify(request.url);
@@ -168,7 +169,6 @@ try {
     var opts = {
       method: request.method,
       headers: request.headers,
-      // Do NOT force 'include' or 'cors'. Let Unity use whatever it already asked for.
       credentials: request.credentials,
       mode: request.mode,
       cache: request.cache,
@@ -181,6 +181,7 @@ try {
     }
     return NATIVE_FETCH(proxified, opts);
   };
+
   var nativeOpen = XMLHttpRequest.prototype.open;
   XMLHttpRequest.prototype.open = function(method, url){
     var args = Array.prototype.slice.call(arguments);
@@ -188,11 +189,18 @@ try {
     console.log('[proxy-xhr]', method, url, '->', args[1]);
     return nativeOpen.apply(this, args);
   };
+
   var nativeSend = XMLHttpRequest.prototype.send;
   XMLHttpRequest.prototype.send = function(){
     this.addEventListener('error', function(){ console.error('[proxy-xhr-error]', this.status, this.responseURL); });
     return nativeSend.apply(this, arguments);
   };
+
+  if (NATIVE_BEACON) {
+    navigator.sendBeacon = function(url, data){
+      try { return NATIVE_BEACON(H.proxify(String(url)), data); }
+      catch (e) { return NATIVE_BEACON(url, data); }
+    };
   }
   console.log('[proxy-step-2] network ok');
 } catch (e) { console.error('[proxy-step-2] FAILED:', e && e.message); }
@@ -273,7 +281,7 @@ try {
   }
   patch(HTMLIFrameElement.prototype, 'src');
   patch(HTMLScriptElement.prototype, 'src');
-  //patch(HTMLImageElement.prototype, 'src');
+  patch(HTMLImageElement.prototype, 'src');
   patch(HTMLLinkElement.prototype, 'href');
   patch(HTMLAnchorElement.prototype, 'href');
   patch(HTMLSourceElement.prototype, 'src');
