@@ -233,14 +233,14 @@ try {
       return url;
     }
   }
-  /*
+  
   window.WebSocket = new Proxy(NATIVE_WS, {
     construct: function(target, args) {
       if (args.length > 0 && args[0] != null) args[0] = proxifyWs(String(args[0]));
       return Reflect.construct(target, args);
     }
   });
-  */
+  
   console.log('[proxy-step-3] ws ok');
 } catch (e) { console.error('[proxy-step-3] FAILED:', e && e.message); }
 })();
@@ -259,6 +259,7 @@ try {
   }
   var nativeOpen2 = window.open.bind(window);
   window.open = function(url){ return nativeOpen2(H.proxify(String(url))); };
+  
   var nativeCreate = document.createElement.bind(document);
   document.createElement = function(tag){
     var el = nativeCreate(tag);
@@ -272,6 +273,7 @@ try {
     }
     return el;
   };
+  
   function patch(proto, prop){
     var d = Object.getOwnPropertyDescriptor(proto, prop);
     if (!d || !d.get || !d.set || !d.configurable) return;
@@ -281,15 +283,16 @@ try {
       set: function(v){ d.set.call(this, typeof v === 'string' ? H.proxify(v) : v); }
     });
   }
+  
   patch(HTMLIFrameElement.prototype, 'src');
   patch(HTMLScriptElement.prototype, 'src');
-  patch(HTMLImageElement.prototype, 'src');
   patch(HTMLLinkElement.prototype, 'href');
   patch(HTMLAnchorElement.prototype, 'href');
   patch(HTMLSourceElement.prototype, 'src');
   patch(HTMLMediaElement.prototype, 'src');
   patch(HTMLVideoElement.prototype, 'poster');
   patch(HTMLFormElement.prototype, 'action');
+  
   var urlAttrs = { src: 1, href: 1, action: 1, formaction: 1, poster: 1 };
   var nativeSetAttr = Element.prototype.setAttribute;
   Element.prototype.setAttribute = function(name, value) {
@@ -316,18 +319,6 @@ try {
       return img;
     }
   });
-
-  // NEW: Catch dynamically injected CSS background-images
-  var nativeSetProperty = CSSStyleDeclaration.prototype.setProperty;
-  CSSStyleDeclaration.prototype.setProperty = function(prop, value, priority) {
-    if (prop === 'background-image' || prop === 'background') {
-      value = String(value).replace(/url\(['"]?([^'"]+)['"]?\)/gi, function(match, url) {
-        return 'url("' + H.proxify(url) + '")';
-      });
-    }
-    return nativeSetProperty.call(this, prop, value, priority);
-  };
-
 
   var observer = new MutationObserver(function(mutations) {
     for (var i = 0; i < mutations.length; i++) {
@@ -479,6 +470,7 @@ async function proxyRequest(req, res, target) {
     res.writeHead(upstream.status, headerObj);
     return res.end(css);
   }
+  
   if (/application\/json/i.test(ct) || (ct.includes('text/plain') && target.hostname.includes('matchmaking'))) {
     const text = await upstream.text();
     if (text.includes('ws://') || text.includes('wss://') || text.includes('"')) {
@@ -496,18 +488,6 @@ async function proxyRequest(req, res, target) {
     headerObj['content-type'] = 'text/plain; charset=utf-8';
     res.writeHead(upstream.status, headerObj);
     return res.end(text);
-  }
-    const text = await upstream.text();
-    const originToken = Buffer.from(target.origin, 'utf8').toString('base64url');
-    const wsScheme = (req.headers['x-forwarded-proto'] === 'https' || req.socket.encrypted) ? 'wss' : 'ws';
-    const rewritten = text.replace(/(["'])wss?:\/\/[^"']+\1/gi, (match, q) => {
-      const url = match.slice(1, -1);
-      const encoded = Buffer.from(url.replace(/^wss:\/\//i, 'https://').replace(/^ws:\/\//i, 'http://')).toString('base64url');
-      return `${q}${wsScheme}://${req.headers.host}/_ws/${encoded}?o=${originToken}${q}`;
-    });
-    headerObj['content-type'] = 'application/json; charset=utf-8';
-    res.writeHead(upstream.status, headerObj);
-    return res.end(rewritten);
   }
 
   res.writeHead(upstream.status, headerObj);
