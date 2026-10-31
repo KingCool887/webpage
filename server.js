@@ -129,33 +129,19 @@ function rewriteHtml(html, target) {
 
   // runtime: NO WebSocket monkey-patch. Everything else patched.
   const runtime = `<script>(function(){
-    // --- probe: Worker errors ---
-    if (window.Worker) {
-      var NativeWorker = window.Worker;
-      window.Worker = function(url, opts){
-        var w = new NativeWorker(url, opts);
-        w.addEventListener('error', function(e){
-          console.error('[probe-worker-err]', e.message, '@', e.filename + ':' + e.lineno);
-        });
-        w.addEventListener('messageerror', function(e){
-          console.error('[probe-worker-msg-err]', e);
-        });
-        return w;
-      };
-      window.Worker.prototype = NativeWorker.prototype;
-    }
     window.addEventListener('error', function(e){
       console.error('[proxy-err]', e.message, '@', e.filename + ':' + e.lineno + ':' + e.colno, e.error);
     });
     window.addEventListener('unhandledrejection', function(e){
       console.error('[proxy-rej]', e.reason);
     });
+
     var TARGET_BASE = ${JSON.stringify(target.origin)};
     var TARGET_HOSTNAME = new URL(TARGET_BASE).hostname;
     var NATIVE_FETCH = window.fetch.bind(window);
     var NATIVE_BEACON = navigator.sendBeacon ? navigator.sendBeacon.bind(navigator) : null;
 
-    function encode(v){ return btoa(unescape(encodeURIComponent(v))).replace(/\\+/g,'-').replace(/\\//g,'_').replace(/=+$/g,''); }
+    function encode(v){ return btoa(unescape(encodeURIComponent(v))).replace(/\+/g,'-').replace(/\//g,'_').replace(/=+$/g,''); }
 
     function proxify(value){
       if (typeof value !== 'string') value = String(value);
@@ -170,7 +156,6 @@ function rewriteHtml(html, target) {
       } catch (e) { return value; }
     }
 
-    // WebSocket (Proxy-based; preserves toString and instanceof)
     var NATIVE_WS = window.WebSocket;
     function proxifyWs(url){
       if (typeof url !== 'string') url = String(url);
@@ -194,15 +179,11 @@ function rewriteHtml(html, target) {
     }
     window.WebSocket = new Proxy(NATIVE_WS, {
       construct: function(target, args) {
-        if (args.length > 0) args[0] = proxifyWs(String(args[0]));
+        if (args.length > 0 && args[0] != null) args[0] = proxifyWs(String(args[0]));
         return Reflect.construct(target, args);
       }
     });
 
-    // fetch
-    window.fetch = async function(input, init){
-      var request = input instanceof Request ? input : new Request(input, init);
-      var proxified = proxify(request.url);
     window.fetch = async function(input, init){
       var request = input instanceof Request ? input : new Request(input, init);
       var proxified = proxify(request.url);
@@ -220,7 +201,6 @@ function rewriteHtml(html, target) {
       return NATIVE_FETCH(proxified, opts);
     };
 
-    // XHR
     var nativeOpen = XMLHttpRequest.prototype.open;
     XMLHttpRequest.prototype.open = function(method, url){
       var args = Array.prototype.slice.call(arguments);
@@ -228,7 +208,6 @@ function rewriteHtml(html, target) {
       return nativeOpen.apply(this, args);
     };
 
-    // sendBeacon
     if (NATIVE_BEACON) {
       navigator.sendBeacon = function(url, data){
         try { return NATIVE_BEACON(proxify(String(url)), data); }
@@ -236,7 +215,6 @@ function rewriteHtml(html, target) {
       };
     }
 
-    // EventSource
     if (window.EventSource) {
       var ES = window.EventSource;
       window.EventSource = function(url, opts){ return new ES(proxify(String(url)), opts); };
@@ -246,11 +224,9 @@ function rewriteHtml(html, target) {
       window.EventSource.CLOSED = ES.CLOSED;
     }
 
-    // window.open
     var nativeOpen2 = window.open.bind(window);
     window.open = function(url){ return nativeOpen2(proxify(String(url))); };
 
-    // createElement + setAttribute
     var nativeCreate = document.createElement.bind(document);
     document.createElement = function(tag){
       var el = nativeCreate(tag);
@@ -265,7 +241,6 @@ function rewriteHtml(html, target) {
       return el;
     };
 
-    // URL property patches
     function patch(proto, prop){
       var d = Object.getOwnPropertyDescriptor(proto, prop);
       if (!d || !d.get || !d.set || !d.configurable) return;
@@ -285,11 +260,6 @@ function rewriteHtml(html, target) {
     patch(HTMLVideoElement.prototype, 'poster');
     patch(HTMLFormElement.prototype, 'action');
 
-
-
-    // Global setAttribute — catches new Image().setAttribute('src', ...),
-    // which bypasses the document.createElement patch because new Image()
-    // doesn't route through createElement internally.
     var urlAttrs = { src: 1, href: 1, action: 1, formaction: 1, poster: 1 };
     var nativeSetAttr = Element.prototype.setAttribute;
     Element.prototype.setAttribute = function(name, value) {
@@ -299,7 +269,6 @@ function rewriteHtml(html, target) {
       return nativeSetAttr.call(this, name, value);
     };
 
-    // Service worker register
     if (navigator.serviceWorker) {
       var nativeReg = navigator.serviceWorker.register;
       navigator.serviceWorker.register = function(scriptURL, opts){
@@ -307,8 +276,6 @@ function rewriteHtml(html, target) {
       };
     }
 
-    var imgDesc = Object.getOwnPropertyDescriptor(HTMLImageElement.prototype, 'src');
-    console.log('[proxy] img.src descriptor:', imgDesc ? { hasGet: !!imgDesc.get, hasSet: !!imgDesc.set, configurable: imgDesc.configurable } : 'missing');
     console.log('[proxy] runtime installed target=' + TARGET_BASE);
   })();</script>`;
 
