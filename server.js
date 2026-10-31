@@ -333,31 +333,6 @@ try {
   });
   observer.observe(document.documentElement, { childList: true, subtree: true, attributes: true, attributeFilter: ['src'] });
 
-  var nativeSetProperty = CSSStyleDeclaration.prototype.setProperty;
-  CSSStyleDeclaration.prototype.setProperty = function(prop, value, priority) {
-    if (prop === 'background-image' || prop === 'background') {
-      value = String(value).replace(/url\(['"]?([^'"]+)['"]?\)/gi, function(match, url) {
-        return 'url("' + H.proxify(url) + '")';
-      });
-    }
-    return nativeSetProperty.call(this, prop, value, priority);
-  };
-
-  ['backgroundImage', 'background'].forEach(function(prop) {
-    var d = Object.getOwnPropertyDescriptor(CSSStyleDeclaration.prototype, prop);
-    if (d && d.set) {
-      Object.defineProperty(CSSStyleDeclaration.prototype, prop, {
-        set: function(v) {
-          if (typeof v === 'string') {
-            v = v.replace(/url\(['"]?([^'"]+)['"]?\)/gi, function(match, url) {
-              return 'url("' + H.proxify(url) + '")';
-            });
-          }
-          d.set.call(this, v);
-        }
-      });
-    }
-  });
   console.log('[proxy-step-4] dom ok');
 } catch (e) { console.error('[proxy-step-4] FAILED:', e && e.message); }
 })();
