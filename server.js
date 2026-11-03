@@ -288,29 +288,6 @@ function rewriteHtml(html, target) {
       }
     });
 
-    // WebSocket patch
-    var NATIVE_WS = window.WebSocket;
-    window.WebSocket = new Proxy(NATIVE_WS, {
-      construct: function(target, args){
-        if (args.length > 0 && args[0] != null) {
-          var original = String(args[0]);
-          try {
-            var u = new URL(original, TARGET_BASE);
-            var proto = u.protocol;
-            if (proto === 'ws:' || proto === 'wss:' || proto === 'http:' || proto === 'https:') {
-              var isSecure = proto === 'wss:' || proto === 'https:';
-              var targetOrigin = (isSecure ? 'https:' : 'http:') + '//' + u.hostname + (u.port ? ':' + u.port : '');
-              var wsScheme = location.protocol === 'https:' ? 'wss:' : 'ws:';
-              var sep = u.search ? '&' : '?';
-              args[0] = wsScheme + '//' + location.host + '/_ws/' + encode(targetOrigin) + u.pathname + u.search + sep + 'o=' + encode(TARGET_BASE);
-              console.log('[ws]', original, '->', args[0]);
-            }
-          } catch (e) { console.log('[ws-err]', original, e.message); }
-        }
-        return Reflect.construct(target, args);
-      }
-    });
-
     // Service worker register
     if (navigator.serviceWorker) {
       var nativeReg = navigator.serviceWorker.register;
