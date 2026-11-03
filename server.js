@@ -163,7 +163,15 @@ function rewriteHtml(html, target) {
       if (request.body && request.method !== 'GET' && request.method !== 'HEAD') {
         opts.body = await request.clone().arrayBuffer();
       }
-      return NATIVE_FETCH(proxified, opts);
+      try {
+        var res = await NATIVE_FETCH(proxified, opts);
+        if (!request.url.startsWith('data:')) console.log('[fetch]', request.method, request.url, '->', res.status);
+        return res;
+      } catch (e) {
+        console.log('[fetch-err]', request.method, request.url, e.message);
+        throw e;
+      }
+    };
     };
 
     // XHR
@@ -223,7 +231,19 @@ function rewriteHtml(html, target) {
     }
     patch(HTMLIFrameElement.prototype, 'src');
     patch(HTMLScriptElement.prototype, 'src');
-    patch(HTMLImageElement.prototype, 'src');
+    (function(){
+      var d = Object.getOwnPropertyDescriptor(HTMLImageElement.prototype, 'src');
+      if (!d || !d.get || !d.set || !d.configurable) { console.log('[img.src] cannot patch'); return; }
+      Object.defineProperty(HTMLImageElement.prototype, 'src', {
+        configurable: true, enumerable: d.enumerable,
+        get: function(){ return d.get.call(this); },
+        set: function(v){
+          var proxified = typeof v === 'string' ? proxify(v) : v;
+          if (typeof v === 'string' && v !== proxified) console.log('[img.src]', v, '->', proxified);
+          return d.set.call(this, proxified);
+        }
+      });
+    })();
     patch(HTMLLinkElement.prototype, 'href');
     patch(HTMLAnchorElement.prototype, 'href');
     patch(HTMLSourceElement.prototype, 'src');
@@ -244,6 +264,29 @@ function rewriteHtml(html, target) {
       }
       return nativeSetAttr.call(this, name, value);
     };
+
+    // WebSocket — route through our /_ws/ proxy
+    var NATIVE_WS = window.WebSocket;
+    window.WebSocket = new Proxy(NATIVE_WS, {
+      construct: function(target, args){
+        if (args.length > 0 && args[0] != null) {
+          var original = String(args[0]);
+          try {
+            var u = new URL(original, TARGET_BASE);
+            if (u.protocol === 'ws:' || u.protocol === 'wss:' || u.protocol === 'http:' || u.protocol === 'https:') {
+              var isSecure = u.protocol === 'wss:' || u.protocol === 'https:';
+              var targetOrigin = (isSecure ? 'https:' : 'http:') + '//' + u.hostname + (u.port ? ':' + u.port : '');
+              var wsScheme = location.protocol === 'https:' ? 'wss:' : 'ws:';
+              var sep = u.search ? '&' : '?';
+              var proxified = wsScheme + '//' + location.host + '/_ws/' + encode(targetOrigin) + u.pathname + u.search + sep + 'o=' + encode(TARGET_BASE);
+              console.log('[ws] ' + original + ' -> ' + proxified);
+              args[0] = proxified;
+            }
+          } catch (e) { console.log('[ws] error ' + original + ': ' + e.message); }
+        }
+        return Reflect.construct(target, args);
+      }
+    });
 
     // Service worker register
     if (navigator.serviceWorker) {
