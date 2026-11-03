@@ -212,7 +212,8 @@ try {
 try {
   var H = window.__proxyHelpers;
   if (!H) { console.error('[proxy-step-3] helpers missing'); return; }
-  var NATIVE_WS = window.WebSocket;
+  
+  var NativeWebSocket = window.WebSocket;
   function proxifyWs(url){
     if (typeof url !== 'string') url = String(url);
     if (/^(data:|blob:|javascript:|mailto:|tel:|about:)/i.test(url)) return url;
@@ -233,14 +234,19 @@ try {
       return url;
     }
   }
-  
-  window.WebSocket = new Proxy(NATIVE_WS, {
-    construct: function(target, args) {
-      if (args.length > 0 && args[0] != null) args[0] = proxifyWs(String(args[0]));
-      return Reflect.construct(target, args);
-    }
-  });
-  
+
+  var PatchedWebSocket = function(url, protocols) {
+    var proxifiedUrl = proxifyWs(String(url));
+    if (protocols === undefined) return new NativeWebSocket(proxifiedUrl);
+    return new NativeWebSocket(proxifiedUrl, protocols);
+  };
+  PatchedWebSocket.prototype = NativeWebSocket.prototype;
+  PatchedWebSocket.CONNECTING = NativeWebSocket.CONNECTING;
+  PatchedWebSocket.OPEN = NativeWebSocket.OPEN;
+  PatchedWebSocket.CLOSING = NativeWebSocket.CLOSING;
+  PatchedWebSocket.CLOSED = NativeWebSocket.CLOSED;
+  window.WebSocket = PatchedWebSocket;
+
   console.log('[proxy-step-3] ws ok');
 } catch (e) { console.error('[proxy-step-3] FAILED:', e && e.message); }
 })();
@@ -249,6 +255,7 @@ try {
 try {
   var H = window.__proxyHelpers;
   if (!H) { console.error('[proxy-step-4] helpers missing'); return; }
+  
   if (window.EventSource) {
     var ES = window.EventSource;
     window.EventSource = function(url, opts){ return new ES(H.proxify(String(url)), opts); };
@@ -257,6 +264,7 @@ try {
     window.EventSource.OPEN = ES.OPEN;
     window.EventSource.CLOSED = ES.CLOSED;
   }
+  
   var nativeOpen2 = window.open.bind(window);
   window.open = function(url){ return nativeOpen2(H.proxify(String(url))); };
   
@@ -286,13 +294,13 @@ try {
   
   patch(HTMLIFrameElement.prototype, 'src');
   patch(HTMLScriptElement.prototype, 'src');
+  patch(HTMLImageElement.prototype, 'src');
   patch(HTMLLinkElement.prototype, 'href');
   patch(HTMLAnchorElement.prototype, 'href');
   patch(HTMLSourceElement.prototype, 'src');
   patch(HTMLMediaElement.prototype, 'src');
   patch(HTMLVideoElement.prototype, 'poster');
   patch(HTMLFormElement.prototype, 'action');
-  patch(HTMLImageElement.prototype, 'src');
   
   var urlAttrs = { src: 1, href: 1, action: 1, formaction: 1, poster: 1 };
   var nativeSetAttr = Element.prototype.setAttribute;
@@ -308,7 +316,7 @@ try {
       var m = mutations[i];
       if (m.type === 'attributes' && m.attributeName === 'src' && m.target.tagName === 'IMG') {
         var src = m.target.getAttribute('src');
-        if (src && !src.startsWith('/p/') && !src.startsWith('data:') && !src.startsWith('blob:')) {
+        if (src && !src.startsWith('/p/') && !src.startsWith('data:')) {
           m.target.setAttribute('src', H.proxify(src));
         }
       } else if (m.type === 'childList') {
