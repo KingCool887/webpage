@@ -212,8 +212,7 @@ try {
 try {
   var H = window.__proxyHelpers;
   if (!H) { console.error('[proxy-step-3] helpers missing'); return; }
-  
-  var NativeWebSocket = window.WebSocket;
+  var NATIVE_WS = window.WebSocket;
   function proxifyWs(url){
     if (typeof url !== 'string') url = String(url);
     if (/^(data:|blob:|javascript:|mailto:|tel:|about:)/i.test(url)) return url;
@@ -234,19 +233,14 @@ try {
       return url;
     }
   }
-
-  var PatchedWebSocket = function(url, protocols) {
-    var proxifiedUrl = proxifyWs(String(url));
-    if (protocols === undefined) return new NativeWebSocket(proxifiedUrl);
-    return new NativeWebSocket(proxifiedUrl, protocols);
-  };
-  PatchedWebSocket.prototype = NativeWebSocket.prototype;
-  PatchedWebSocket.CONNECTING = NativeWebSocket.CONNECTING;
-  PatchedWebSocket.OPEN = NativeWebSocket.OPEN;
-  PatchedWebSocket.CLOSING = NativeWebSocket.CLOSING;
-  PatchedWebSocket.CLOSED = NativeWebSocket.CLOSED;
-  window.WebSocket = PatchedWebSocket;
-
+  
+  window.WebSocket = new Proxy(NATIVE_WS, {
+    construct: function(target, args) {
+      if (args.length > 0 && args[0] != null) args[0] = proxifyWs(String(args[0]));
+      return Reflect.construct(target, args);
+    }
+  });
+  
   console.log('[proxy-step-3] ws ok');
 } catch (e) { console.error('[proxy-step-3] FAILED:', e && e.message); }
 })();
@@ -255,7 +249,6 @@ try {
 try {
   var H = window.__proxyHelpers;
   if (!H) { console.error('[proxy-step-4] helpers missing'); return; }
-  
   if (window.EventSource) {
     var ES = window.EventSource;
     window.EventSource = function(url, opts){ return new ES(H.proxify(String(url)), opts); };
@@ -264,7 +257,6 @@ try {
     window.EventSource.OPEN = ES.OPEN;
     window.EventSource.CLOSED = ES.CLOSED;
   }
-  
   var nativeOpen2 = window.open.bind(window);
   window.open = function(url){ return nativeOpen2(H.proxify(String(url))); };
   
