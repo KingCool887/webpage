@@ -292,6 +292,7 @@ try {
   patch(HTMLMediaElement.prototype, 'src');
   patch(HTMLVideoElement.prototype, 'poster');
   patch(HTMLFormElement.prototype, 'action');
+  patch(HTMLImageElement.prototype, 'src');
   
   var urlAttrs = { src: 1, href: 1, action: 1, formaction: 1, poster: 1 };
   var nativeSetAttr = Element.prototype.setAttribute;
@@ -302,30 +303,12 @@ try {
     return nativeSetAttr.call(this, name, value);
   };
 
-  var OriginalImage = window.Image;
-  window.Image = new Proxy(OriginalImage, {
-    construct: function(target, args) {
-      var img = new OriginalImage(...args);
-      var origSrc = Object.getOwnPropertyDescriptor(HTMLImageElement.prototype, 'src');
-      Object.defineProperty(img, 'src', {
-        set: function(val) {
-          if (typeof val === 'string') val = H.proxify(val);
-          origSrc.set.call(img, val);
-        },
-        get: function() {
-          return origSrc.get.call(img);
-        }
-      });
-      return img;
-    }
-  });
-
   var observer = new MutationObserver(function(mutations) {
     for (var i = 0; i < mutations.length; i++) {
       var m = mutations[i];
       if (m.type === 'attributes' && m.attributeName === 'src' && m.target.tagName === 'IMG') {
         var src = m.target.getAttribute('src');
-        if (src && !src.startsWith('/p/') && !src.startsWith('data:')) {
+        if (src && !src.startsWith('/p/') && !src.startsWith('data:') && !src.startsWith('blob:')) {
           m.target.setAttribute('src', H.proxify(src));
         }
       } else if (m.type === 'childList') {
