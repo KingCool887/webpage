@@ -16,8 +16,8 @@ const COOKIE_NAME = '__proxy_access';
 const MAX_REQUEST_BYTES = 32 * 1024 * 1024;
 const MAX_WS_PER_SESSION = 20;
 
-const lastMatchIpByTarget = new Map();
-const proxyHostTargets = new Map();
+const lastMatchIpByTarget = new Map();   // `${sessionId}:${targetOrigin}` -> 32-hex
+const proxyHostTargets = new Map();       // sanitized req.host -> target origin (for legacy /ws)
 const wsCountByKey = new Map();
 
 // ---------- users ----------
@@ -127,227 +127,136 @@ function rewriteHtml(html, target) {
   out = out.replace(/<style\b([^>]*)>([\s\S]*?)<\/style\s*>/gi, (m, a, css) => `<style${a}>${rewriteCss(css, target)}</style>`);
   out = out.replace(/\sstyle=(['"])(.*?)\1/gi, (m, q, css) => ` style=${q}${rewriteCss(css, target)}${q}`);
 
-  const runtime = `<script>
-(function(){
-try {
-  var TARGET_BASE = ${JSON.stringify(target.origin)};
-  var TARGET_HOSTNAME = new URL(TARGET_BASE).hostname;
-  function encode(v){
-    return btoa(unescape(encodeURIComponent(v)))
-      .split('+').join('-')
-      .split('/').join('_')
-      .replace(/=+$/, '');
-  }
-  function proxify(value){
-    if (typeof value !== 'string') value = String(value);
-    if (/^(data:|blob:|javascript:|mailto:|tel:|about:)/i.test(value)) return value;
-    try {
-      var current = new URL(value, TARGET_BASE);
-      if (current.protocol !== 'http:' && current.protocol !== 'https:') return value;
-      if (current.hostname.indexOf('.') < 0) return value;
-      if (current.pathname.indexOf('/p/') === 0) return current.pathname + current.search;
-      if (current.pathname.indexOf('/_ws/') === 0) return current.pathname + current.search;
-      return '/p/' + encode(current.origin) + current.pathname + current.search;
-    } catch (e) { return value; }
-  }
-  window.__proxyHelpers = { TARGET_BASE: TARGET_BASE, encode: encode, proxify: proxify };
-  console.log('[proxy-step-1] helpers ok, target=' + TARGET_BASE);
-} catch (e) { console.error('[proxy-step-1] FAILED:', e && e.message); }
-})();
-</script><script>
-(function(){
-try {
-  var H = window.__proxyHelpers;
-  if (!H) { console.error('[proxy-step-2] helpers missing'); return; }
-  var NATIVE_FETCH = window.fetch.bind(window);
-  var NATIVE_BEACON = navigator.sendBeacon ? navigator.sendBeacon.bind(navigator) : null;
+  // runtime: NO WebSocket monkey-patch. Everything else patched.
+  const runtime = `<script>(function(){
+    var TARGET_BASE = ${JSON.stringify(target.origin)};
+    var TARGET_HOSTNAME = new URL(TARGET_BASE).hostname;
+    var NATIVE_FETCH = window.fetch.bind(window);
+    var NATIVE_BEACON = navigator.sendBeacon ? navigator.sendBeacon.bind(navigator) : null;
 
-  window.fetch = async function(input, init) {
-    var request = input instanceof Request ? input : new Request(input, init);
-    var proxified = H.proxify(request.url);
-    var opts = {
-      method: request.method, headers: request.headers,
-      credentials: request.credentials, mode: request.mode,
-      cache: request.cache, redirect: request.redirect,
-      integrity: request.integrity, signal: request.signal
+    function encode(v){ return btoa(unescape(encodeURIComponent(v))).replace(/\\+/g,'-').replace(/\\//g,'_').replace(/=+$/g,''); }
+
+    function proxify(value){
+      if (typeof value !== 'string') value = String(value);
+      if (/^(data:|blob:|javascript:|mailto:|tel:|about:)/i.test(value)) return value;
+      try {
+        var current = new URL(value, TARGET_BASE);
+        if (current.protocol !== 'http:' && current.protocol !== 'https:') return value;
+        if (current.hostname.indexOf('.') < 0) return value;
+        if (current.pathname.indexOf('/p/') === 0) return current.pathname + current.search;
+        if (current.pathname.indexOf('/_ws/') === 0) return current.pathname + current.search;
+        return '/p/' + encode(current.origin) + current.pathname + current.search;
+      } catch (e) { return value; }
+    }
+
+    // fetch
+    window.fetch = async function(input, init){
+      var request = input instanceof Request ? input : new Request(input, init);
+      var proxified = proxify(request.url);
+      var opts = {
+        method: request.method, headers: request.headers,
+        mode: request.mode === 'navigate' ? 'cors' : request.mode,
+        credentials: 'include',
+        cache: request.cache, redirect: request.redirect,
+        integrity: request.integrity, signal: request.signal
+      };
+      if (request.body && request.method !== 'GET' && request.method !== 'HEAD') {
+        opts.body = await request.clone().arrayBuffer();
+      }
+      return NATIVE_FETCH(proxified, opts);
     };
-    if (request.body && request.method !== 'GET' && request.method !== 'HEAD') {
-      opts.body = await request.clone().arrayBuffer();
-    }
-    try {
-      var res = await NATIVE_FETCH(proxified, opts);
-      console.log('[proxy-fetch-res]', request.url, '->', res.status);
-      return res;
-    } catch (e) {
-      console.error('[proxy-fetch-err]', request.url, e);
-      throw e;
-    }
-  };
 
-  var nativeOpen = XMLHttpRequest.prototype.open;
-  XMLHttpRequest.prototype.open = function(method, url){
-    var args = Array.prototype.slice.call(arguments);
-    args[1] = H.proxify(String(url));
-    console.log('[proxy-xhr]', method, url, '->', args[1]);
-    return nativeOpen.apply(this, args);
-  };
-
-  var nativeSend = XMLHttpRequest.prototype.send;
-  XMLHttpRequest.prototype.send = function(){
-    this.addEventListener('error', function(){ console.error('[proxy-xhr-error]', this.status, this.responseURL); });
-    return nativeSend.apply(this, arguments);
-  };
-
-  if (NATIVE_BEACON) {
-    navigator.sendBeacon = function(url, data){
-      try { return NATIVE_BEACON(H.proxify(String(url)), data); }
-      catch (e) { return NATIVE_BEACON(url, data); }
+    // XHR
+    var nativeOpen = XMLHttpRequest.prototype.open;
+    XMLHttpRequest.prototype.open = function(method, url){
+      var args = Array.prototype.slice.call(arguments);
+      args[1] = proxify(String(url));
+      return nativeOpen.apply(this, args);
     };
-  }
-  console.log('[proxy-step-2] network ok');
-} catch (e) { console.error('[proxy-step-2] FAILED:', e && e.message); }
-})();
-</script><script>
-(function(){
-try {
-  var H = window.__proxyHelpers;
-  if (!H) { console.error('[proxy-step-3] helpers missing'); return; }
-  var NATIVE_WS = window.WebSocket;
-  function proxifyWs(url){
-    if (typeof url !== 'string') url = String(url);
-    if (/^(data:|blob:|javascript:|mailto:|tel:|about:)/i.test(url)) return url;
-    try {
-      var u = new URL(url, H.TARGET_BASE);
-      var proto = u.protocol;
-      if (proto !== 'ws:' && proto !== 'wss:' && proto !== 'http:' && proto !== 'https:') return url;
-      if (u.pathname.indexOf('/_ws/') === 0) return url;
-      var host = u.hostname + (u.port ? ':' + u.port : '');
-      var originScheme = (proto === 'wss:' || proto === 'https:') ? 'https:' : 'http:';
-      var targetOrigin = originScheme + '//' + host;
-      var wsScheme = location.protocol === 'https:' ? 'wss:' : 'ws:';
-      var result = wsScheme + '//' + location.host + '/_ws/' + H.encode(targetOrigin) + u.pathname + u.search + '?o=' + H.encode(H.TARGET_BASE);
-      console.log('[proxy-ws] ' + url + ' -> ' + result);
-      return result;
-    } catch (e) {
-      console.log('[proxy-ws] could not proxify ' + url + ': ' + e.message);
-      return url;
-    }
-  }
-  
-  window.WebSocket = new Proxy(NATIVE_WS, {
-    construct: function(target, args) {
-      if (args.length > 0 && args[0] != null) args[0] = proxifyWs(String(args[0]));
-      return Reflect.construct(target, args);
-    }
-  });
-  
-  console.log('[proxy-step-3] ws ok');
-} catch (e) { console.error('[proxy-step-3] FAILED:', e && e.message); }
-})();
-</script><script>
-(function(){
-try {
-  var H = window.__proxyHelpers;
-  if (!H) { console.error('[proxy-step-4] helpers missing'); return; }
-  if (window.EventSource) {
-    var ES = window.EventSource;
-    window.EventSource = function(url, opts){ return new ES(H.proxify(String(url)), opts); };
-    window.EventSource.prototype = ES.prototype;
-    window.EventSource.CONNECTING = ES.CONNECTING;
-    window.EventSource.OPEN = ES.OPEN;
-    window.EventSource.CLOSED = ES.CLOSED;
-  }
-  var nativeOpen2 = window.open.bind(window);
-  window.open = function(url){ return nativeOpen2(H.proxify(String(url))); };
-  
-  var nativeCreate = document.createElement.bind(document);
-  document.createElement = function(tag){
-    var el = nativeCreate(tag);
-    if (tag && (tag.toLowerCase() === 'script' || tag.toLowerCase() === 'link' || tag.toLowerCase() === 'img')) {
-      var nativeSet = el.setAttribute;
-      el.setAttribute = function(name, value){
-        var l = String(name).toLowerCase();
-        if (l === 'src' || l === 'href') value = H.proxify(String(value));
-        return nativeSet.call(el, name, value);
+
+    // sendBeacon
+    if (NATIVE_BEACON) {
+      navigator.sendBeacon = function(url, data){
+        try { return NATIVE_BEACON(proxify(String(url)), data); }
+        catch (e) { return NATIVE_BEACON(url, data); }
       };
     }
-    return el;
-  };
-  
-  function patch(proto, prop){
-    var d = Object.getOwnPropertyDescriptor(proto, prop);
-    if (!d || !d.get || !d.set || !d.configurable) return;
-    Object.defineProperty(proto, prop, {
-      configurable: true, enumerable: d.enumerable,
-      get: function(){ return d.get.call(this); },
-      set: function(v){ d.set.call(this, typeof v === 'string' ? H.proxify(v) : v); }
-    });
-  }
-  
-  patch(HTMLIFrameElement.prototype, 'src');
-  patch(HTMLScriptElement.prototype, 'src');
-  patch(HTMLImageElement.prototype, 'src');
-  patch(HTMLLinkElement.prototype, 'href');
-  patch(HTMLAnchorElement.prototype, 'href');
-  patch(HTMLSourceElement.prototype, 'src');
-  patch(HTMLMediaElement.prototype, 'src');
-  patch(HTMLVideoElement.prototype, 'poster');
-  patch(HTMLFormElement.prototype, 'action');
-  
-  var urlAttrs = { src: 1, href: 1, action: 1, formaction: 1, poster: 1 };
-  var nativeSetAttr = Element.prototype.setAttribute;
-  Element.prototype.setAttribute = function(name, value) {
-    if (urlAttrs[String(name).toLowerCase()] && typeof value === 'string') {
-      value = H.proxify(value);
-    }
-    return nativeSetAttr.call(this, name, value);
-  };
 
-  var observer = new MutationObserver(function(mutations) {
-    for (var i = 0; i < mutations.length; i++) {
-      var m = mutations[i];
-      if (m.type === 'attributes' && m.attributeName === 'src' && m.target.tagName === 'IMG') {
-        var src = m.target.getAttribute('src');
-        if (src && !src.startsWith('/p/') && !src.startsWith('data:')) {
-          m.target.setAttribute('src', H.proxify(src));
-        }
-      } else if (m.type === 'childList') {
-        m.addedNodes.forEach(function(node) {
-          if (node.tagName === 'IMG' && node.src) node.src = H.proxify(node.src);
-          if (node.querySelectorAll) {
-            var imgs = node.querySelectorAll('img');
-            for (var j = 0; j < imgs.length; j++) { imgs[j].src = H.proxify(imgs[j].src); }
-          }
-        });
+    // EventSource
+    if (window.EventSource) {
+      var ES = window.EventSource;
+      window.EventSource = function(url, opts){ return new ES(proxify(String(url)), opts); };
+      window.EventSource.prototype = ES.prototype;
+      window.EventSource.CONNECTING = ES.CONNECTING;
+      window.EventSource.OPEN = ES.OPEN;
+      window.EventSource.CLOSED = ES.CLOSED;
+    }
+
+    // window.open
+    var nativeOpen2 = window.open.bind(window);
+    window.open = function(url){ return nativeOpen2(proxify(String(url))); };
+
+    // createElement + setAttribute
+    var nativeCreate = document.createElement.bind(document);
+    document.createElement = function(tag){
+      var el = nativeCreate(tag);
+      if (tag && (tag.toLowerCase() === 'script' || tag.toLowerCase() === 'link' || tag.toLowerCase() === 'img')) {
+        var nativeSet = el.setAttribute;
+        el.setAttribute = function(name, value){
+          var l = String(name).toLowerCase();
+          if (l === 'src' || l === 'href') value = proxify(String(value));
+          return nativeSet.call(el, name, value);
+        };
       }
-    }
-  });
-  observer.observe(document.documentElement, { childList: true, subtree: true, attributes: true, attributeFilter: ['src'] });
-
-  console.log('[proxy-step-4] dom ok');
-} catch (e) { console.error('[proxy-step-4] FAILED:', e && e.message); }
-})();
-</script><script>
-(function(){
-try {
-  var H = window.__proxyHelpers;
-  if (!H) { console.error('[proxy-step-5] helpers missing'); return; }
-  if (navigator.serviceWorker) {
-    var nativeReg = navigator.serviceWorker.register;
-    navigator.serviceWorker.register = function(scriptURL, opts){
-      return nativeReg.call(this, H.proxify(String(scriptURL)), opts);
+      return el;
     };
-  }
-  window.addEventListener('error', function(e){
-    console.error('[proxy-err]', e.message, '@', e.filename + ':' + e.lineno + ':' + e.colno);
-  });
-  window.addEventListener('unhandledrejection', function(e){
-    console.error('[proxy-rej]', e.reason);
-  });
-  console.log('[proxy-step-5] done');
-} catch (e) { console.error('[proxy-step-5] FAILED:', e && e.message); }
-})();
-</script>`;
+
+    // URL property patches
+    function patch(proto, prop){
+      var d = Object.getOwnPropertyDescriptor(proto, prop);
+      if (!d || !d.get || !d.set || !d.configurable) return;
+      Object.defineProperty(proto, prop, {
+        configurable: true, enumerable: d.enumerable,
+        get: function(){ return d.get.call(this); },
+        set: function(v){ d.set.call(this, typeof v === 'string' ? proxify(v) : v); }
+      });
+    }
+    patch(HTMLIFrameElement.prototype, 'src');
+    patch(HTMLScriptElement.prototype, 'src');
+    patch(HTMLImageElement.prototype, 'src');
+    patch(HTMLLinkElement.prototype, 'href');
+    patch(HTMLAnchorElement.prototype, 'href');
+    patch(HTMLSourceElement.prototype, 'src');
+    patch(HTMLMediaElement.prototype, 'src');
+    patch(HTMLVideoElement.prototype, 'poster');
+    patch(HTMLFormElement.prototype, 'action');
+
+
+
+    // Global setAttribute — catches new Image().setAttribute('src', ...),
+    // which bypasses the document.createElement patch because new Image()
+    // doesn't route through createElement internally.
+    var urlAttrs = { src: 1, href: 1, action: 1, formaction: 1, poster: 1 };
+    var nativeSetAttr = Element.prototype.setAttribute;
+    Element.prototype.setAttribute = function(name, value) {
+      if (urlAttrs[String(name).toLowerCase()] && typeof value === 'string') {
+        value = proxify(value);
+      }
+      return nativeSetAttr.call(this, name, value);
+    };
+
+    // Service worker register
+    if (navigator.serviceWorker) {
+      var nativeReg = navigator.serviceWorker.register;
+      navigator.serviceWorker.register = function(scriptURL, opts){
+        return nativeReg.call(this, proxify(String(scriptURL)), opts);
+      };
+    }
+
+    var imgDesc = Object.getOwnPropertyDescriptor(HTMLImageElement.prototype, 'src');
+    console.log('[proxy] img.src descriptor:', imgDesc ? { hasGet: !!imgDesc.get, hasSet: !!imgDesc.set, configurable: imgDesc.configurable } : 'missing');
+    console.log('[proxy] runtime installed target=' + TARGET_BASE);
+  })();</script>`;
 
   if (/<head\b[^>]*>/i.test(out)) out = out.replace(/<head\b[^>]*>/i, h => `${h}${runtime}`);
   else out = runtime + out;
@@ -355,6 +264,9 @@ try {
 }
 
 // ---------- cookies ----------
+// Note: cookies are scoped to Path=/ (not /p/<token>/) so they are also sent
+// on /_ws/ WebSocket upgrades. Without this, session cookies set on the page
+// are missing on the party socket and the server rejects the handshake.
 function rewriteSetCookie(cookie, target) {
   let out = cookie.replace(/;\s*domain=[^;]*/i, '');
   out = out.replace(/;\s*path=[^;]*/i, '; Path=/');
@@ -391,15 +303,7 @@ async function proxyRequest(req, res, target) {
   const cookie = (req.headers.cookie || '').split(';').map(c => c.trim())
     .filter(c => c && !c.startsWith(COOKIE_NAME + '=')).join('; ');
   if (cookie) headers.set('cookie', cookie);
-  let pageOrigin = target.origin;
-  if (req.headers.referer) {
-    try {
-      const r = new URL(req.headers.referer);
-      const m = r.pathname.match(/^\/p\/([A-Za-z0-9_-]+)/);
-      if (m) pageOrigin = decodeTarget(m[1]).origin;
-    } catch {}
-  }
-  if (req.headers.origin) headers.set('origin', pageOrigin);
+  if (req.headers.origin) headers.set('origin', target.origin);
   if (req.headers.referer) {
     try {
       const r = new URL(req.headers.referer);
@@ -453,24 +357,19 @@ async function proxyRequest(req, res, target) {
     res.writeHead(upstream.status, headerObj);
     return res.end(css);
   }
-  
-  if (/application\/json/i.test(ct) || (ct.includes('text/plain') && target.hostname.includes('matchmaking'))) {
+  if (/application\/json|text\/plain/i.test(ct)) {
     const text = await upstream.text();
-    if (text.includes('ws://') || text.includes('wss://') || text.includes('"')) {
-      const originToken = Buffer.from(target.origin, 'utf8').toString('base64url');
-      const wsScheme = (req.headers['x-forwarded-proto'] === 'https' || req.socket.encrypted) ? 'wss' : 'ws';
-      const rewritten = text.replace(/(["'])wss?:\/\/[^"']+\1/gi, (match, q) => {
-        const url = match.slice(1, -1);
-        const encoded = Buffer.from(url.replace(/^wss:\/\//i, 'https://').replace(/^ws:\/\//i, 'http://')).toString('base64url');
-        return `${q}${wsScheme}://${req.headers.host}/_ws/${encoded}?o=${originToken}${q}`;
-      });
-      headerObj['content-type'] = 'application/json; charset=utf-8';
-      res.writeHead(upstream.status, headerObj);
-      return res.end(rewritten);
-    }
-    headerObj['content-type'] = 'text/plain; charset=utf-8';
+    console.log(`[json] ${target.hostname}${target.pathname.slice(0, 40)} (${text.length}B): ${text.slice(0, 300).replace(/\s+/g, ' ')}`);
+    const originToken = Buffer.from(target.origin, 'utf8').toString('base64url');
+    const wsScheme = (req.headers['x-forwarded-proto'] === 'https' || req.socket.encrypted) ? 'wss' : 'ws';
+    const rewritten = text.replace(/(["'])wss?:\/\/[^"']+\1/gi, (match, q) => {
+      const url = match.slice(1, -1);
+      const encoded = Buffer.from(url.replace(/^wss:\/\//i, 'https://').replace(/^ws:\/\//i, 'http://')).toString('base64url');
+      return `${q}${wsScheme}://${req.headers.host}/_ws/${encoded}?o=${originToken}${q}`;
+    });
+    headerObj['content-type'] = 'application/json; charset=utf-8';
     res.writeHead(upstream.status, headerObj);
-    return res.end(text);
+    return res.end(rewritten);
   }
 
   res.writeHead(upstream.status, headerObj);
@@ -536,6 +435,7 @@ async function relayUpgrade(req, client, head, target, originOverride, sid) {
     client.write(buf);
     upstream.removeListener('data', onData);
 
+    // Match IP capture: sniff party socket traffic
     if (target.hostname.startsWith('party.') || target.hostname.includes('.party.') || target.hostname.startsWith('ip_')) {
       const needle = Buffer.from([0xa2, 0x69, 0x70, 0xd9, 0x20]);
       let tail = Buffer.alloc(0);
@@ -637,11 +537,10 @@ server.on('upgrade', async (req, client, head) => {
       target.protocol = target.protocol === 'https:' ? 'wss:' : 'ws:';
       const o = local.searchParams.get('o');
       if (o) try { originOverride = Buffer.from(o, 'base64url').toString('utf8'); } catch {}
-      local.searchParams.delete('o');
-      target.search = local.searchParams.toString() ? '?' + local.searchParams.toString() : '';
       await validatePublicTarget(target);
       console.log(`[ws] explicit -> ${target.href} origin=${originOverride || '(none)'} sid=${sid.slice(0, 8)}`);
     } else {
+      // Relative /ws upgrade. Find the target via Referer.
       let pageTarget = null;
       const ref = req.headers.referer;
       if (ref) {
