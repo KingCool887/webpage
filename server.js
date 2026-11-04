@@ -276,6 +276,10 @@ async function proxyRequest(req, res, target) {
   const cookie = (req.headers.cookie || '').split(';').map(c => c.trim())
     .filter(c => c && !c.startsWith(COOKIE_NAME + '=')).join('; ');
   if (cookie) headers.set('cookie', cookie);
+  
+  // Force identity encoding so Content-Length matches the actual bytes sent.
+  // Node's fetch decompresses gzip by default, which breaks the Content-Length.
+  headers.set('accept-encoding', 'identity');
   if (req.headers.origin) headers.set('origin', target.origin);
   if (req.headers.referer) {
     try {
@@ -289,7 +293,7 @@ async function proxyRequest(req, res, target) {
   const upstream = await fetch(target, { method: req.method, headers, body, redirect: 'manual' });
 
   const out = new Headers(upstream.headers);
-  for (const n of ['content-security-policy','content-security-policy-report-only','x-frame-options',
+   for (const n of ['content-security-policy','content-security-policy-report-only','x-frame-options',
                    'cross-origin-opener-policy','cross-origin-embedder-policy','cross-origin-resource-policy',
                    'permissions-policy','access-control-allow-origin','access-control-allow-credentials',
                    'content-encoding','transfer-encoding','connection','set-cookie','alt-svc']) {
