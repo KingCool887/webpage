@@ -364,7 +364,7 @@ async function proxyRequest(req, res, target) {
   for (const n of ['content-security-policy','content-security-policy-report-only','x-frame-options',
                    'cross-origin-opener-policy','cross-origin-embedder-policy','cross-origin-resource-policy',
                    'permissions-policy','access-control-allow-origin','access-control-allow-credentials',
-                   'content-encoding','transfer-encoding','connection','set-cookie','alt-svc']) {
+                   'content-encoding','content-length','transfer-encoding','connection','set-cookie','alt-svc']) {
     out.delete(n);
   }
   const ct = upstream.headers.get('content-type') || '';
