@@ -364,7 +364,7 @@ async function proxyRequest(req, res, target) {
   for (const n of ['content-security-policy','content-security-policy-report-only','x-frame-options',
                    'cross-origin-opener-policy','cross-origin-embedder-policy','cross-origin-resource-policy',
                    'permissions-policy','access-control-allow-origin','access-control-allow-credentials',
-                   'content-encoding','content-length','transfer-encoding','connection','set-cookie','alt-svc']) {
+                   'content-encoding','transfer-encoding','connection','set-cookie','alt-svc']) {
     out.delete(n);
   }
   const ct = upstream.headers.get('content-type') || '';
@@ -553,6 +553,34 @@ const server = http.createServer({ timeout: 0 }, async (req, res) => {
       res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' });
       return res.end(page);
     } catch { return res.writeHead(500).end('index.html missing'); }
+  }
+
+  // Fallback for Web Worker / relative requests (like final.pkg)
+  let refererTarget = null;
+  if (req.headers.referer) {
+    try {
+      const r = new URL(req.headers.referer);
+      const m = r.pathname.match(/^\/p\/([A-Za-z0-9_-]+)/);
+      if (m) refererTarget = decodeTarget(m[1]).origin;
+    } catch {}
+  }
+  
+  if (!refererTarget) {
+    const host = String(req.headers.host || '').split(':')[0];
+    refererTarget = proxyHostTargets.get(host);
+  }
+
+  if (refererTarget) {
+    try {
+      const target = new URL(local.pathname + local.search, refererTarget);
+      console.log(`[fallback] ${local.pathname} -> ${target.href}`);
+      return proxyRequest(req, res, target).catch((e) => {
+        if (!res.headersSent) res.writeHead(502, { 'Content-Type': 'text/plain' });
+        res.end('Upstream failed: ' + e.message);
+      });
+    } catch (e) {
+      return res.writeHead(400).end(e.message);
+    }
   }
 
   res.writeHead(404).end('Not found');
