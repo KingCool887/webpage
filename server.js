@@ -177,7 +177,9 @@ function rewriteHtml(html, target) {
     var nativeOpen = XMLHttpRequest.prototype.open;
     XMLHttpRequest.prototype.open = function(method, url){
       var args = Array.prototype.slice.call(arguments);
-      args[1] = proxify(String(url));
+      var original = String(url);
+      args[1] = proxify(original);
+      if (original !== args[1]) console.log('[xhr]', method, original, '->', args[1]);
       return nativeOpen.apply(this, args);
     };
 
@@ -400,7 +402,7 @@ async function proxyRequest(req, res, target) {
     res.writeHead(upstream.status, headerObj);
     return res.end(css);
   }
-  if (/application\/json|text\/plain/i.test(ct)) {
+  if (/application\/json/i.test(ct) || (ct.includes('text/plain') && target.hostname.includes('matchmaking'))) {
     const text = await upstream.text();
     console.log(`[json] ${target.hostname}${target.pathname.slice(0, 40)} (${text.length}B): ${text.slice(0, 300).replace(/\s+/g, ' ')}`);
     const originToken = Buffer.from(target.origin, 'utf8').toString('base64url');
