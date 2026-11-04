@@ -116,6 +116,8 @@ function rewriteHtml(html, target) {
   const ap = new RegExp(`(\\b(?:${attrs.join('|')})\\s*=\\s*)(["'])(.*?)\\2`, 'gis');
   let out = html.replace(ap, (m, p, q, v) => `${p}${q}${resolveLink(v, target)}${q}`);
   out = out.replace(/<meta\b[^>]*http-equiv\s*=\s*(["'])?content-security-policy\1?[^>]*>/gi, '');
+  // Remove preload links so Unity fetches the .pkg directly through our shim
+  out = out.replace(/<link\b[^>]*rel=["']preload["'][^>]*>/gi, '');
   // Remove preload links for the main asset to force a standard fetch through our shim
   out = out.replace(/<link\b[^>]*rel=["']preload["'][^>]*final\.pkg[^>]*>/gi, '');
   out = out.replace(/srcset\s*=\s*(["'])(.*?)\1/gis, (m, q, v) => {
@@ -344,12 +346,17 @@ async function proxyRequest(req, res, target) {
     return res.end(rewritten);
   }
 
+  if (!upstream.body || req.method === 'HEAD') {
+    res.writeHead(upstream.status, headerObj);
+    return res.end();
+  }
+
+  // Buffer binary files (like .pkg, .wasm) to ensure Content-Length is correct.
+  // Unity WebGL crashes if Content-Length is missing on these files.
+  const buffer = Buffer.from(await upstream.arrayBuffer());
+  headerObj['content-length'] = buffer.byteLength;
   res.writeHead(upstream.status, headerObj);
-  if (!upstream.body || req.method === 'HEAD') return res.end();
-  const ds = Readable.fromWeb(upstream.body);
-  ds.on('error', () => { if (!res.destroyed) res.destroy(); });
-  res.on('close', () => { if (!res.writableFinished) ds.destroy(); });
-  ds.pipe(res);
+  res.end(buffer);
 }
 
 // ---------- WebSocket relay ----------
