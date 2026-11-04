@@ -194,29 +194,36 @@ function rewriteHtml(html, target) {
       };
     }
 
-    // WebSocket — route through our /_ws/ proxy
-    var NATIVE_WS = window.WebSocket;
-    window.WebSocket = new Proxy(NATIVE_WS, {
-      construct: function(target, args){
-        if (args.length > 0 && args[0] != null) {
-          var original = String(args[0]);
-          try {
-            var u = new URL(original, TARGET_BASE);
-            var alreadyProxied = (u.hostname === location.hostname && u.pathname.indexOf('/_ws/') === 0);
-            if (!alreadyProxied && (u.protocol === 'ws:' || u.protocol === 'wss:' || u.protocol === 'http:' || u.protocol === 'https:')) {
-              var isSecure = u.protocol === 'wss:' || u.protocol === 'https:';
-              var targetOrigin = (isSecure ? 'https:' : 'http:') + '//' + u.hostname + (u.port ? ':' + u.port : '');
-              var wsScheme = location.protocol === 'https:' ? 'wss:' : 'ws:';
-              var sep = u.search ? '&' : '?';
-              var proxified = wsScheme + '//' + location.host + '/_ws/' + encode(targetOrigin) + u.pathname + u.search + sep + 'o=' + encode(TARGET_BASE);
-              console.log('[ws] ' + original + ' -> ' + proxified);
-              args[0] = proxified;
-            }
-          } catch (e) { console.log('[ws] error ' + original + ': ' + e.message); }
-        }
-        return Reflect.construct(target, args);
+    // WebSocket — route through our /_ws/ proxy (Safe function wrapper)
+    var NativeWebSocket = window.WebSocket;
+    function PatchedWebSocket(url, protocols) {
+      var finalUrl = String(url);
+      if (url != null) {
+        try {
+          var u = new URL(finalUrl, TARGET_BASE);
+          var alreadyProxied = (u.hostname === location.hostname && u.pathname.indexOf('/_ws/') === 0);
+          if (!alreadyProxied && (u.protocol === 'ws:' || u.protocol === 'wss:' || u.protocol === 'http:' || u.protocol === 'https:')) {
+            var isSecure = u.protocol === 'wss:' || u.protocol === 'https:';
+            var targetOrigin = (isSecure ? 'https:' : 'http:') + '//' + u.hostname + (u.port ? ':' + u.port : '');
+            var wsScheme = location.protocol === 'https:' ? 'wss:' : 'ws:';
+            var sep = u.search ? '&' : '?';
+            finalUrl = wsScheme + '//' + location.host + '/_ws/' + encode(targetOrigin) + u.pathname + u.search + sep + 'o=' + encode(TARGET_BASE);
+            console.log('[ws] ' + url + ' -> ' + finalUrl);
+          }
+        } catch (e) { console.log('[ws] error ' + url + ': ' + e.message); }
       }
-    });
+      
+      if (protocols) {
+        return new NativeWebSocket(finalUrl, protocols);
+      }
+      return new NativeWebSocket(finalUrl);
+    }
+    PatchedWebSocket.prototype = NativeWebSocket.prototype;
+    PatchedWebSocket.CONNECTING = NativeWebSocket.CONNECTING;
+    PatchedWebSocket.OPEN = NativeWebSocket.OPEN;
+    PatchedWebSocket.CLOSING = NativeWebSocket.CLOSING;
+    PatchedWebSocket.CLOSED = NativeWebSocket.CLOSED;
+    window.WebSocket = PatchedWebSocket;
 
     // Service worker register
     if (navigator.serviceWorker) {
@@ -276,6 +283,9 @@ async function proxyRequest(req, res, target) {
   const cookie = (req.headers.cookie || '').split(';').map(c => c.trim())
     .filter(c => c && !c.startsWith(COOKIE_NAME + '=')).join('; ');
   if (cookie) headers.set('cookie', cookie);
+  
+  // Force identity encoding so Content-Length matches the actual bytes sent.
+  headers.set('accept-encoding', 'identity');
   
   // Force identity encoding so Content-Length matches the actual bytes sent.
   // Node's fetch decompresses gzip by default, which breaks the Content-Length.
