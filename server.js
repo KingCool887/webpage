@@ -116,6 +116,8 @@ function rewriteHtml(html, target) {
   const ap = new RegExp(`(\\b(?:${attrs.join('|')})\\s*=\\s*)(["'])(.*?)\\2`, 'gis');
   let out = html.replace(ap, (m, p, q, v) => `${p}${q}${resolveLink(v, target)}${q}`);
   out = out.replace(/<meta\b[^>]*http-equiv\s*=\s*(["'])?content-security-policy\1?[^>]*>/gi, '');
+  // Remove preload links for the main asset to force a standard fetch through our shim
+  out = out.replace(/<link\b[^>]*rel=["']preload["'][^>]*final\.pkg[^>]*>/gi, '');
   out = out.replace(/srcset\s*=\s*(["'])(.*?)\1/gis, (m, q, v) => {
     const items = v.split(',').map(item => {
       const parts = item.trim().split(/\s+/);
@@ -498,7 +500,7 @@ const server = http.createServer({ timeout: 0 }, async (req, res) => {
   if (refererTarget) {
     try {
       const target = new URL(local.pathname + local.search, refererTarget);
-      console.log(`[fallback] ${local.pathname} -> ${target.href}`);
+      console.log(`[fallback] ${local.pathname} -> ${target.href} (referer: ${req.headers.referer || 'none'})`);
       return proxyRequest(req, res, target).catch((e) => {
         if (!res.headersSent) res.writeHead(502, { 'Content-Type': 'text/plain' });
         res.end('Upstream failed: ' + e.message);
