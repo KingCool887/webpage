@@ -169,7 +169,7 @@ function rewriteHtml(html, target) {
       // Mock bare server IDs from matchmaking to bypass DNS failures
       if (url.startsWith('https://') && url.indexOf('.') < 0) {
         console.log('[fetch-mock]', url);
-        return new Response('{"ok":true}', { status: 200, headers: { 'Content-Type': 'application/json' } });
+        return new Response(null, { status: 200, headers: { 'Access-Control-Allow-Origin': '*', 'Content-Type': 'application/json' } });
       }
       
       var proxified = proxify(url);
