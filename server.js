@@ -156,11 +156,6 @@ function rewriteHtml(html, target) {
         return '/p/' + encode(current.origin) + current.pathname + current.search;
       } catch (e) { return value; }
     }
-        if (current.pathname.indexOf('/p/') === 0) return current.pathname + current.search;
-        if (current.pathname.indexOf('/_ws/') === 0) return current.pathname + current.search;
-        return '/p/' + encode(current.origin) + current.pathname + current.search;
-      } catch (e) { return value; }
-    }
 
     // fetch
     window.fetch = async function(input, init){
