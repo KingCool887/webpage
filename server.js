@@ -89,6 +89,10 @@ function isPrivateAddress(a) {
 }
 async function validatePublicTarget(t) {
   const h = t.hostname.toLowerCase();
+  
+  // Bypass validation for known game domains to prevent dynamic DNS errors
+  if (h.endsWith('.party.deadshot.io') || h === 'party.deadshot.io' || h === 'matchmaking.deadshot.io') return;
+  
   if (h === 'localhost' || h.endsWith('.localhost') || h.endsWith('.local')) throw new Error('Local addr.');
   if (net.isIP(h)) { if (isPrivateAddress(h)) throw new Error('Private addr.'); return; }
   const ans = await lookup(h, { all: true, verbatim: true });
@@ -160,7 +164,15 @@ function rewriteHtml(html, target) {
     // fetch
     window.fetch = async function(input, init){
       var request = input instanceof Request ? input : new Request(input, init);
-      var proxified = proxify(request.url);
+      var url = request.url;
+      
+      // Mock bare server IDs from matchmaking to bypass DNS failures
+      if (url.startsWith('https://') && url.indexOf('.') < 0) {
+        console.log('[fetch-mock]', url);
+        return new Response('{"ok":true}', { status: 200, headers: { 'Content-Type': 'application/json' } });
+      }
+      
+      var proxified = proxify(url);
       var opts = {
         method: request.method, headers: request.headers,
         mode: request.mode === 'navigate' ? 'cors' : request.mode,
@@ -204,11 +216,17 @@ function rewriteHtml(html, target) {
     setTimeout(function() {
       var NativeWebSocket = window.WebSocket;
       function PatchedWebSocket(url, protocols) {
-        var finalUrl = String(url);
-        if (url != null) {
-          try {
-            var u = new URL(finalUrl, TARGET_BASE);
-            var alreadyProxied = (u.hostname === location.hostname && u.pathname.indexOf('/_ws/') === 0);
+      var finalUrl = String(url);
+      if (url != null) {
+        try {
+          var u = new URL(finalUrl, TARGET_BASE);
+          
+          // Fix bare hostnames in WebSockets too
+          if (u.hostname.indexOf('.') < 0) {
+            u.hostname = u.hostname + '.party.' + TARGET_HOSTNAME;
+          }
+          
+          var alreadyProxied = (u.hostname === location.hostname && u.pathname.indexOf('/_ws/') === 0);
             if (!alreadyProxied && (u.protocol === 'ws:' || u.protocol === 'wss:' || u.protocol === 'http:' || u.protocol === 'https:')) {
               var isSecure = u.protocol === 'wss:' || u.protocol === 'https:';
               var targetOrigin = (isSecure ? 'https:' : 'http:') + '//' + u.hostname + (u.port ? ':' + u.port : '');
