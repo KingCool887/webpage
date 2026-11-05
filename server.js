@@ -183,6 +183,12 @@ function rewriteHtml(html, target) {
       try {
         var res = await NATIVE_FETCH(proxified, opts);
         if (!request.url.startsWith('data:')) console.log('[fetch]', request.method, request.url, '->', res.status);
+        
+        // Patch WebSockets exactly when matchmaking succeeds
+        if (url.indexOf('/admission') !== -1) {
+          applyWebSocketPatch();
+        }
+        
         return res;
       } catch (e) {
         console.log('[fetch-err]', request.method, request.url, e.message);
@@ -206,37 +212,41 @@ function rewriteHtml(html, target) {
       };
     }
 
-    // --- Immediate WebSocket Patch ---
-    var NativeWebSocket = window.WebSocket;
-    function PatchedWebSocket(url, protocols) {
-      var finalUrl = String(url);
-      if (url != null) {
-        try {
-          var u = new URL(finalUrl, TARGET_BASE);
-          if (u.hostname.indexOf('.') < 0) {
-            u.hostname = u.hostname + '.party.' + TARGET_HOSTNAME;
-          }
-          var alreadyProxied = (u.hostname === location.hostname && u.pathname.indexOf('/_ws/') === 0);
-          if (!alreadyProxied && (u.protocol === 'ws:' || u.protocol === 'wss:' || u.protocol === 'http:' || u.protocol === 'https:')) {
-            var isSecure = u.protocol === 'wss:' || u.protocol === 'https:';
-            var targetOrigin = (isSecure ? 'https:' : 'http:') + '//' + u.hostname + (u.port ? ':' + u.port : '');
-            var wsScheme = location.protocol === 'https:' ? 'wss:' : 'ws:';
-            var sep = u.search ? '&' : '?';
-            finalUrl = wsScheme + '//' + location.host + '/_ws/' + encode(targetOrigin) + u.pathname + u.search + sep + 'o=' + encode(TARGET_BASE);
-            console.log('[ws] ' + url + ' -> ' + finalUrl);
-          }
-        } catch (e) { console.log('[ws] error ' + url + ': ' + e.message); }
+    // --- On-Demand WebSocket Patch (Safe for Unity startup) ---
+    function applyWebSocketPatch() {
+      if (window.WebSocket.__patched) return;
+      var NativeWebSocket = window.WebSocket;
+      function PatchedWebSocket(url, protocols) {
+        var finalUrl = String(url);
+        if (url != null) {
+          try {
+            var u = new URL(finalUrl, TARGET_BASE);
+            if (u.hostname.indexOf('.') < 0) {
+              u.hostname = u.hostname + '.party.' + TARGET_HOSTNAME;
+            }
+            var alreadyProxied = (u.hostname === location.hostname && u.pathname.indexOf('/_ws/') === 0);
+            if (!alreadyProxied && (u.protocol === 'ws:' || u.protocol === 'wss:' || u.protocol === 'http:' || u.protocol === 'https:')) {
+              var isSecure = u.protocol === 'wss:' || u.protocol === 'https:';
+              var targetOrigin = (isSecure ? 'https:' : 'http:') + '//' + u.hostname + (u.port ? ':' + u.port : '');
+              var wsScheme = location.protocol === 'https:' ? 'wss:' : 'ws:';
+              var sep = u.search ? '&' : '?';
+              finalUrl = wsScheme + '//' + location.host + '/_ws/' + encode(targetOrigin) + u.pathname + u.search + sep + 'o=' + encode(TARGET_BASE);
+              console.log('[ws] ' + url + ' -> ' + finalUrl);
+            }
+          } catch (e) { console.log('[ws] error ' + url + ': ' + e.message); }
+        }
+        if (protocols) return new NativeWebSocket(finalUrl, protocols);
+        return new NativeWebSocket(finalUrl);
       }
-      if (protocols) return new NativeWebSocket(finalUrl, protocols);
-      return new NativeWebSocket(finalUrl);
+      PatchedWebSocket.prototype = NativeWebSocket.prototype;
+      PatchedWebSocket.CONNECTING = NativeWebSocket.CONNECTING;
+      PatchedWebSocket.OPEN = NativeWebSocket.OPEN;
+      PatchedWebSocket.CLOSING = NativeWebSocket.CLOSING;
+      PatchedWebSocket.CLOSED = NativeWebSocket.CLOSED;
+      PatchedWebSocket.__patched = true;
+      window.WebSocket = PatchedWebSocket;
+      console.log('[ws] WebSocket patched via matchmaking interceptor');
     }
-    PatchedWebSocket.prototype = NativeWebSocket.prototype;
-    PatchedWebSocket.CONNECTING = NativeWebSocket.CONNECTING;
-    PatchedWebSocket.OPEN = NativeWebSocket.OPEN;
-    PatchedWebSocket.CLOSING = NativeWebSocket.CLOSING;
-    PatchedWebSocket.CLOSED = NativeWebSocket.CLOSED;
-    window.WebSocket = PatchedWebSocket;
-    console.log('[proxy] runtime installed with immediate WS patch');
     console.log('[proxy] runtime installed target=' + TARGET_BASE);
   })();</script>`;
 
@@ -285,9 +295,6 @@ async function proxyRequest(req, res, target) {
   const cookie = (req.headers.cookie || '').split(';').map(c => c.trim())
     .filter(c => c && !c.startsWith(COOKIE_NAME + '=')).join('; ');
   if (cookie) headers.set('cookie', cookie);
-  
-  // Force identity encoding so Content-Length matches the actual bytes sent.
-  headers.set('accept-encoding', 'identity');
   
   // Force identity encoding so Content-Length matches the actual bytes sent.
   // Node's fetch decompresses gzip by default, which breaks the Content-Length.
