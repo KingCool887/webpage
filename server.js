@@ -152,7 +152,6 @@ function rewriteHtml(html, target) {
         if (current.pathname.indexOf('/p/') === 0) return current.pathname + current.search;
         if (current.pathname.indexOf('/_ws/') === 0) return current.pathname + current.search;
         
-        // Fix bare hostnames from matchmaking (e.g., https://m25d7ue8i4xg/)
         if (current.hostname.indexOf('.') < 0) {
           current.hostname = current.hostname + '.party.' + TARGET_HOSTNAME;
         }
@@ -161,15 +160,10 @@ function rewriteHtml(html, target) {
       } catch (e) { return value; }
     }
 
-    // Apply WebSocket patch on the first mouse click (right before Unity tries to connect)
-    document.addEventListener('mousedown', applyWebSocketPatch, { once: true });
-
-    // fetch
     window.fetch = async function(input, init){
       var request = input instanceof Request ? input : new Request(input, init);
       var url = request.url;
       
-      // Mock bare server IDs from matchmaking to bypass DNS failures
       if (url.startsWith('https://') && url.indexOf('.') < 0) {
         console.log('[fetch-mock]', url);
         return new Response(null, { status: 200, headers: { 'Access-Control-Allow-Origin': '*', 'Content-Type': 'application/json' } });
@@ -189,14 +183,13 @@ function rewriteHtml(html, target) {
       try {
         var res = await NATIVE_FETCH(proxified, opts);
         if (!request.url.startsWith('data:')) console.log('[fetch]', request.method, request.url, '->', res.status);
-        
         return res;
       } catch (e) {
         console.log('[fetch-err]', request.method, request.url, e.message);
         throw e;
       }
     };
-    // XHR
+
     var nativeOpen = XMLHttpRequest.prototype.open;
     XMLHttpRequest.prototype.open = function(method, url){
       var args = Array.prototype.slice.call(arguments);
@@ -206,7 +199,6 @@ function rewriteHtml(html, target) {
       return nativeOpen.apply(this, args);
     };
 
-    // sendBeacon
     if (NATIVE_BEACON) {
       navigator.sendBeacon = function(url, data){
         try { return NATIVE_BEACON(proxify(String(url)), data); }
@@ -214,18 +206,16 @@ function rewriteHtml(html, target) {
       };
     }
 
-    // WebSocket patch - applied immediately to catch Unity's cached reference
+    // --- Immediate WebSocket Patch ---
     var NativeWebSocket = window.WebSocket;
     function PatchedWebSocket(url, protocols) {
       var finalUrl = String(url);
       if (url != null) {
         try {
           var u = new URL(finalUrl, TARGET_BASE);
-          
           if (u.hostname.indexOf('.') < 0) {
             u.hostname = u.hostname + '.party.' + TARGET_HOSTNAME;
           }
-          
           var alreadyProxied = (u.hostname === location.hostname && u.pathname.indexOf('/_ws/') === 0);
           if (!alreadyProxied && (u.protocol === 'ws:' || u.protocol === 'wss:' || u.protocol === 'http:' || u.protocol === 'https:')) {
             var isSecure = u.protocol === 'wss:' || u.protocol === 'https:';
@@ -237,10 +227,7 @@ function rewriteHtml(html, target) {
           }
         } catch (e) { console.log('[ws] error ' + url + ': ' + e.message); }
       }
-      
-      if (protocols) {
-        return new NativeWebSocket(finalUrl, protocols);
-      }
+      if (protocols) return new NativeWebSocket(finalUrl, protocols);
       return new NativeWebSocket(finalUrl);
     }
     PatchedWebSocket.prototype = NativeWebSocket.prototype;
@@ -249,9 +236,7 @@ function rewriteHtml(html, target) {
     PatchedWebSocket.CLOSING = NativeWebSocket.CLOSING;
     PatchedWebSocket.CLOSED = NativeWebSocket.CLOSED;
     window.WebSocket = PatchedWebSocket;
-
-    var imgDesc = Object.getOwnPropertyDescriptor(HTMLImageElement.prototype, 'src');
-    console.log('[proxy] img.src descriptor:', imgDesc ? { hasGet: !!imgDesc.get, hasSet: !!imgDesc.set, configurable: imgDesc.configurable } : 'missing');
+    console.log('[proxy] runtime installed with immediate WS patch');
     console.log('[proxy] runtime installed target=' + TARGET_BASE);
   })();</script>`;
 
