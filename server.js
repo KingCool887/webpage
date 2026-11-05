@@ -211,22 +211,21 @@ function rewriteHtml(html, target) {
       };
     }
 
-    // Delay the WebSocket patch until after Unity finishes booting.
-    // Unity panics if the WebSocket class is changed during initialization.
-    setTimeout(function() {
-      var NativeWebSocket = window.WebSocket;
-      function PatchedWebSocket(url, protocols) {
-      var finalUrl = String(url);
-      if (url != null) {
-        try {
-          var u = new URL(finalUrl, TARGET_BASE);
-          
-          // Fix bare hostnames in WebSockets too
-          if (u.hostname.indexOf('.') < 0) {
-            u.hostname = u.hostname + '.party.' + TARGET_HOSTNAME;
-          }
-          
-          var alreadyProxied = (u.hostname === location.hostname && u.pathname.indexOf('/_ws/') === 0);
+    // WebSocket patch - applied immediately via ES6 class extension
+    var NativeWebSocket = window.WebSocket;
+    class PatchedWebSocket extends NativeWebSocket {
+      constructor(url, protocols) {
+        var finalUrl = String(url);
+        if (url != null) {
+          try {
+            var u = new URL(finalUrl, TARGET_BASE);
+            
+            // Fix bare hostnames if they appear
+            if (u.hostname.indexOf('.') < 0) {
+              u.hostname = u.hostname + '.party.' + TARGET_HOSTNAME;
+            }
+            
+            var alreadyProxied = (u.hostname === location.hostname && u.pathname.indexOf('/_ws/') === 0);
             if (!alreadyProxied && (u.protocol === 'ws:' || u.protocol === 'wss:' || u.protocol === 'http:' || u.protocol === 'https:')) {
               var isSecure = u.protocol === 'wss:' || u.protocol === 'https:';
               var targetOrigin = (isSecure ? 'https:' : 'http:') + '//' + u.hostname + (u.port ? ':' + u.port : '');
@@ -239,18 +238,14 @@ function rewriteHtml(html, target) {
         }
         
         if (protocols) {
-          return new NativeWebSocket(finalUrl, protocols);
+          super(finalUrl, protocols);
+        } else {
+          super(finalUrl);
         }
-        return new NativeWebSocket(finalUrl);
       }
-      PatchedWebSocket.prototype = NativeWebSocket.prototype;
-      PatchedWebSocket.CONNECTING = NativeWebSocket.CONNECTING;
-      PatchedWebSocket.OPEN = NativeWebSocket.OPEN;
-      PatchedWebSocket.CLOSING = NativeWebSocket.CLOSING;
-      PatchedWebSocket.CLOSED = NativeWebSocket.CLOSED;
-      window.WebSocket = PatchedWebSocket;
-      console.log('[proxy] WebSocket patch applied after delay');
-    }, 5000); // Wait 5 seconds for Unity to finish loading final.pkg
+    }
+    window.WebSocket = PatchedWebSocket;
+    console.log('[proxy] WebSocket patch applied immediately');
 
     // Service worker register
     if (navigator.serviceWorker) {
