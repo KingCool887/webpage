@@ -184,11 +184,6 @@ function rewriteHtml(html, target) {
         var res = await NATIVE_FETCH(proxified, opts);
         if (!request.url.startsWith('data:')) console.log('[fetch]', request.method, request.url, '->', res.status);
         
-        // Patch WebSockets exactly when matchmaking succeeds
-        if (url.indexOf('/admission') !== -1) {
-          applyWebSocketPatch();
-        }
-        
         return res;
       } catch (e) {
         console.log('[fetch-err]', request.method, request.url, e.message);
@@ -212,15 +207,15 @@ function rewriteHtml(html, target) {
       };
     }
 
-    // --- On-Demand WebSocket Patch (Safe for Unity startup) ---
-    function applyWebSocketPatch() {
-      if (window.WebSocket.__patched) return;
-      var NativeWebSocket = window.WebSocket;
-      function PatchedWebSocket(url, protocols) {
-        var finalUrl = String(url);
+    // --- Startup WebSocket Proxy (Masked to bypass Emscripten anti-tamper) ---
+    var NativeWebSocket = window.WebSocket;
+    var WSProxy = new Proxy(NativeWebSocket, {
+      construct: function(target, args) {
+        var url = String(args[0]);
+        var finalUrl = url;
         if (url != null) {
           try {
-            var u = new URL(finalUrl, TARGET_BASE);
+            var u = new URL(url, TARGET_BASE);
             if (u.hostname.indexOf('.') < 0) {
               u.hostname = u.hostname + '.party.' + TARGET_HOSTNAME;
             }
@@ -235,19 +230,21 @@ function rewriteHtml(html, target) {
             }
           } catch (e) { console.log('[ws] error ' + url + ': ' + e.message); }
         }
-        if (protocols) return new NativeWebSocket(finalUrl, protocols);
-        return new NativeWebSocket(finalUrl);
+        
+        var newArgs = Array.prototype.slice.call(args);
+        newArgs[0] = finalUrl;
+        return Reflect.construct(target, newArgs);
       }
-      PatchedWebSocket.prototype = NativeWebSocket.prototype;
-      PatchedWebSocket.CONNECTING = NativeWebSocket.CONNECTING;
-      PatchedWebSocket.OPEN = NativeWebSocket.OPEN;
-      PatchedWebSocket.CLOSING = NativeWebSocket.CLOSING;
-      PatchedWebSocket.CLOSED = NativeWebSocket.CLOSED;
-      PatchedWebSocket.__patched = true;
-      window.WebSocket = PatchedWebSocket;
-      console.log('[ws] WebSocket patched via matchmaking interceptor');
-    }
-    console.log('[proxy] runtime installed target=' + TARGET_BASE);
+    });
+
+    // Mask the Proxy so Unity's security checks pass perfectly
+    Object.defineProperty(WSProxy, 'name', { value: 'WebSocket' });
+    Object.defineProperty(WSProxy, 'toString', { value: NativeWebSocket.toString.bind(NativeWebSocket) });
+    WSProxy.prototype = NativeWebSocket.prototype;
+    Object.defineProperty(WSProxy.prototype, 'constructor', { value: WSProxy, configurable: true, writable: true });
+    
+    window.WebSocket = WSProxy;
+    console.log('[proxy] runtime installed with masked WS proxy');
   })();</script>`;
 
   if (/<head\b[^>]*>/i.test(out)) out = out.replace(/<head\b[^>]*>/i, h => `${h}${runtime}`);
