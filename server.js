@@ -161,6 +161,9 @@ function rewriteHtml(html, target) {
       } catch (e) { return value; }
     }
 
+    // Apply WebSocket patch on the first mouse click (right before Unity tries to connect)
+    document.addEventListener('mousedown', applyWebSocketPatch, { once: true });
+
     // fetch
     window.fetch = async function(input, init){
       var request = input instanceof Request ? input : new Request(input, init);
@@ -608,16 +611,31 @@ server.on('upgrade', async (req, client, head) => {
       }
       if (!pageTarget) throw new Error('No target for WS upgrade.');
 
-      const matchKey = `${sid}:${pageTarget.origin}`;
-      const matchIp = lastMatchIpByTarget.get(matchKey);
-      const wsHost = matchIp
-        ? `ip_${matchIp}.party.${pageTarget.hostname}`
-        : `party.${pageTarget.hostname}`;
-      const search = local.search && !local.searchParams.has('__k') ? local.search : '';
-      target = new URL(`wss://${wsHost}${local.pathname}${search}`);
-      originOverride = pageTarget.origin;
-      await validatePublicTarget(target);
-      console.log(`[ws] fallback -> ${target.href} origin=${originOverride} sid=${sid.slice(0, 8)}`);
+          // Check if the relative URL contains a full hostname (e.g., /p/<token>/ip_a5d8.../ws)
+          const pMatch = local.pathname.match(/^\/p\/[A-Za-z0-9_-]+\/([^/]+)(\/.*)?$/);
+          let wsHost, wsPath;
+          
+          if (pMatch) {
+            wsHost = pMatch[1];
+            wsPath = pMatch[2] || '/';
+          } else {
+            const matchKey = `${sid}:${pageTarget.origin}`;
+            const matchIp = lastMatchIpByTarget.get(matchKey);
+            wsHost = matchIp
+              ? `ip_${matchIp}.party.${pageTarget.hostname}`
+              : `party.${pageTarget.hostname}`;
+            wsPath = local.pathname;
+          }
+          
+          if (wsHost.indexOf('.') < 0) {
+            wsHost = wsHost + '.party.' + pageTarget.hostname;
+          }
+          
+          const search = local.search && !local.searchParams.has('__k') ? local.search : '';
+          target = new URL(`wss://${wsHost}${wsPath}${search}`);
+          originOverride = pageTarget.origin;
+          await validatePublicTarget(target);
+          console.log(`[ws] fallback -> ${target.href} origin=${originOverride} sid=${sid.slice(0, 8)}`);
     }
   } catch (e) {
     console.log(`[ws] rejected: ${e.message} sid=${sid.slice(0, 8)}`);
