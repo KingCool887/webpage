@@ -186,13 +186,18 @@ function rewriteHtml(html, target) {
       try {
         var res = await NATIVE_FETCH(proxified, opts);
         if (!request.url.startsWith('data:')) console.log('[fetch]', request.method, request.url, '->', res.status);
+        
+        // Apply the WebSocket patch exactly when matchmaking succeeds
+        if (url.indexOf('/admission') !== -1) {
+          applyWebSocketPatch();
+        }
+        
         return res;
       } catch (e) {
         console.log('[fetch-err]', request.method, request.url, e.message);
         throw e;
       }
     };
-
     // XHR
     var nativeOpen = XMLHttpRequest.prototype.open;
     XMLHttpRequest.prototype.open = function(method, url){
@@ -211,20 +216,18 @@ function rewriteHtml(html, target) {
       };
     }
 
-    // WebSocket patch - applied immediately via ES6 class extension
-    var NativeWebSocket = window.WebSocket;
-    class PatchedWebSocket extends NativeWebSocket {
-      constructor(url, protocols) {
+    // WebSocket patch - applied on-demand to prevent Unity startup crashes
+    function applyWebSocketPatch() {
+      if (window.WebSocket.__patched) return;
+      var NativeWebSocket = window.WebSocket;
+      function PatchedWebSocket(url, protocols) {
         var finalUrl = String(url);
         if (url != null) {
           try {
             var u = new URL(finalUrl, TARGET_BASE);
-            
-            // Fix bare hostnames if they appear
             if (u.hostname.indexOf('.') < 0) {
               u.hostname = u.hostname + '.party.' + TARGET_HOSTNAME;
             }
-            
             var alreadyProxied = (u.hostname === location.hostname && u.pathname.indexOf('/_ws/') === 0);
             if (!alreadyProxied && (u.protocol === 'ws:' || u.protocol === 'wss:' || u.protocol === 'http:' || u.protocol === 'https:')) {
               var isSecure = u.protocol === 'wss:' || u.protocol === 'https:';
@@ -236,16 +239,18 @@ function rewriteHtml(html, target) {
             }
           } catch (e) { console.log('[ws] error ' + url + ': ' + e.message); }
         }
-        
-        if (protocols) {
-          super(finalUrl, protocols);
-        } else {
-          super(finalUrl);
-        }
+        if (protocols) return new NativeWebSocket(finalUrl, protocols);
+        return new NativeWebSocket(finalUrl);
       }
+      PatchedWebSocket.prototype = NativeWebSocket.prototype;
+      PatchedWebSocket.CONNECTING = NativeWebSocket.CONNECTING;
+      PatchedWebSocket.OPEN = NativeWebSocket.OPEN;
+      PatchedWebSocket.CLOSING = NativeWebSocket.CLOSING;
+      PatchedWebSocket.CLOSED = NativeWebSocket.CLOSED;
+      PatchedWebSocket.__patched = true;
+      window.WebSocket = PatchedWebSocket;
+      console.log('[ws] WebSocket patched via matchmaking interceptor');
     }
-    window.WebSocket = PatchedWebSocket;
-    console.log('[proxy] WebSocket patch applied immediately');
 
     // Service worker register
     if (navigator.serviceWorker) {
