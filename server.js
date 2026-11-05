@@ -145,7 +145,17 @@ function rewriteHtml(html, target) {
       try {
         var current = new URL(value, TARGET_BASE);
         if (current.protocol !== 'http:' && current.protocol !== 'https:') return value;
-        if (current.hostname.indexOf('.') < 0) return value;
+        if (current.pathname.indexOf('/p/') === 0) return current.pathname + current.search;
+        if (current.pathname.indexOf('/_ws/') === 0) return current.pathname + current.search;
+        
+        // Fix bare hostnames from matchmaking (e.g., https://m25d7ue8i4xg/)
+        if (current.hostname.indexOf('.') < 0) {
+          current.hostname = current.hostname + '.party.' + TARGET_HOSTNAME;
+        }
+        
+        return '/p/' + encode(current.origin) + current.pathname + current.search;
+      } catch (e) { return value; }
+    }
         if (current.pathname.indexOf('/p/') === 0) return current.pathname + current.search;
         if (current.pathname.indexOf('/_ws/') === 0) return current.pathname + current.search;
         return '/p/' + encode(current.origin) + current.pathname + current.search;
